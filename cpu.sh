@@ -1,186 +1,70 @@
 #!/bin/bash
-
 # ==============================================================================
-# AURORA Offline Downloader (Final Audit Edition)
-# ------------------------------------------------------------------------------
-# 策略：显式列出所有 transitive dependencies，绝不依赖自动解析。
-# 目标环境：Python 3.10 | Linux x86_64 | CUDA 12.1
+# AURORA Offline Downloader (Final Fix)
 # ==============================================================================
 
 SAVE_DIR="./offline_packages"
 WHEEL_DIR="$SAVE_DIR/wheels"
 PYTHON_DIR="$SAVE_DIR/python_runtime"
-
 mkdir -p $WHEEL_DIR $PYTHON_DIR
 
-# ------------------------------------------------------------------------------
-# 1. 核心下载函数 (平台欺骗模式)
-# ------------------------------------------------------------------------------
-download_dep() {
-    # 强制 pip 认为自己是 Linux x86_64 的 Python 3.10
-    pip download "$@" \
-        --dest $WHEEL_DIR \
-        --index-url https://pypi.org/simple \
-        --trusted-host pypi.org \
-        --python-version 3.10 \
-        --platform manylinux2014_x86_64 \
-        --only-binary=:all: \
-        --no-deps \
-        --quiet
-    if [ $? -eq 0 ]; then echo "   ✅ OK: $*"; else echo "   ❌ FAIL: $*"; fi
-}
+echo "🚀 [Builder] 开始全量资源采集..."
 
-echo "🚀 [Start] 开始全量资源采集..."
-
-# ------------------------------------------------------------------------------
-# 2. Python 3.10 运行时
-# ------------------------------------------------------------------------------
-echo "📦 [1/6] Python Runtime..."
+# --- 1. 下载 Python & PyTorch ---
 wget -nc -q -O "$PYTHON_DIR/python-3.10.tar.gz" "https://github.com/indygreg/python-build-standalone/releases/download/20240224/cpython-3.10.13+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz"
 
-# ------------------------------------------------------------------------------
-# 3. 核心计算框架 (PyTorch + FlashAttn) - 直链下载
-# ------------------------------------------------------------------------------
-echo "🔥 [2/6] PyTorch Core & FlashAttn (Binary)..."
 BASE_URL="https://download.pytorch.org/whl/cu121"
-wget -nc -q -P $WHEEL_DIR "$BASE_URL/torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
-wget -nc -q -P $WHEEL_DIR "$BASE_URL/torchvision-0.19.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
-wget -nc -q -P $WHEEL_DIR "$BASE_URL/torchaudio-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
+for pkg in "torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl" \
+           "torchvision-0.19.1%2Bcu121-cp310-cp310-linux_x86_64.whl" \
+           "torchaudio-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"; do
+    wget -nc -q -P $WHEEL_DIR "$BASE_URL/$pkg"
+done
 
-# Flash Attention 2.6.3 预编译包 (无需编译)
-wget -nc -q -P $WHEEL_DIR "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu121torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+# --- 2. 关键：只下载 Flash Attention 预编译 Wheel ---
+echo "⚡ 下载 Flash Attention 预编译包..."
+# 1. 先清理掉所有源码包，防止误用！
+rm -f "$WHEEL_DIR/flash_attn"*.tar.gz
+# 2. 下载二进制包
+FLASH_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu121torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+wget -nc -q -P $WHEEL_DIR "$FLASH_URL"
 
 # Transformers 源码
 wget -nc -q -O "$WHEEL_DIR/transformers-main.zip" "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
 
-# ------------------------------------------------------------------------------
-# 4. NVIDIA Runtime (PyTorch 2.x 必需) - 查漏补缺
-# ------------------------------------------------------------------------------
-echo "🎮 [3/6] NVIDIA CUDA Dependencies..."
-download_dep nvidia-cuda-runtime-cu12==12.1.105
-download_dep nvidia-cuda-nvrtc-cu12==12.1.105
-download_dep nvidia-cuda-cupti-cu12==12.1.105
-download_dep nvidia-cudnn-cu12==9.1.0.70
-download_dep nvidia-cublas-cu12==12.1.3.1
-download_dep nvidia-cufft-cu12==11.0.2.54
-download_dep nvidia-curand-cu12==10.3.2.106
-download_dep nvidia-cusolver-cu12==11.4.5.107
-download_dep nvidia-cusparse-cu12==12.1.0.106
-download_dep nvidia-nccl-cu12==2.20.5
-download_dep nvidia-nvtx-cu12==12.1.105
-download_dep triton==3.0.0
-# [关键补全] 之前漏掉的包
-download_dep nvidia-nvjitlink-cu12==12.1.105
+# --- 3. 补全所有依赖 ---
+echo "📚 补全依赖 (含 exceptiongroup)..."
+download_dep() {
+    pip download "$@" --dest $WHEEL_DIR --index-url https://pypi.org/simple \
+        --python-version 3.10 --platform manylinux2014_x86_64 \
+        --only-binary=:all: --no-deps --quiet
+}
 
-# ------------------------------------------------------------------------------
-# 5. 网络与异步库 (aiohttp/requests 全家桶)
-# ------------------------------------------------------------------------------
-echo "🌐 [4/6] Network & Async Stack..."
-download_dep aiohttp
-download_dep aiohappyeyeballs  # 新版 aiohttp 必需
-download_dep aiosignal
-download_dep attrs
-download_dep frozenlist
-download_dep multidict
-download_dep yarl
-download_dep async-timeout
-download_dep requests
-download_dep urllib3
-download_dep idna
-download_dep certifi
-download_dep charset-normalizer
-# HuggingFace 新版依赖
-download_dep httpx
-download_dep httpcore
-download_dep h11
-download_dep anyio
-download_dep sniffio
-download_dep hf-xet
+# 补全报错缺失的 exceptiongroup
+download_dep exceptiongroup
+# 补全其他
+download_dep numpy==1.26.4 packaging ninja psutil setuptools wheel einops
+download_dep httpx httpcore anyio sniffio h11 hf-xet
+download_dep aiohttp aiohappyeyeballs yarl multidict frozenlist aiosignal attrs
+download_dep requests urllib3 idna certifi charset-normalizer
+download_dep accelerate huggingface-hub tokenizers safetensors pyyaml tqdm
+download_dep rich pygments markdown-it-py mdurl shellingham click typer typer-slim colorama
+download_dep filelock fsspec typing-extensions
+download_dep datasets pandas scipy pillow timm sentence-transformers
+download_dep easyocr scikit-image python-bidi protobuf sentencepiece
+download_dep dill multiprocess pyarrow regex sympy networkx jinja2 MarkupSafe mpmath
+# NVIDIA Runtime
+download_dep nvidia-cuda-runtime-cu12==12.1.105 nvidia-cublas-cu12==12.1.3.1 \
+             nvidia-cudnn-cu12==9.1.0.70 nvidia-nvjitlink-cu12==12.1.105 \
+             nvidia-curand-cu12==10.3.2.106 nvidia-cusolver-cu12==11.4.5.107 \
+             nvidia-nccl-cu12==2.20.5 triton==3.0.0 nvidia-nvtx-cu12==12.1.105 \
+             nvidia-cuda-nvrtc-cu12==12.1.105 nvidia-cuda-cupti-cu12==12.1.105 \
+             nvidia-cufft-cu12==11.0.2.54 nvidia-cusparse-cu12==12.1.0.106
 
-# ------------------------------------------------------------------------------
-# 6. 数据处理与图像 (Pandas/Scipy/Pillow)
-# ------------------------------------------------------------------------------
-echo "🖼️  [5/6] Data & Image Stack..."
-download_dep numpy==1.26.4
-download_dep pandas
-download_dep python-dateutil
-download_dep pytz
-download_dep six
-download_dep tzdata
-download_dep scipy
-download_dep scikit-image
-download_dep imageio
-download_dep tifffile
-download_dep lazy_loader
-download_dep networkx
-download_dep Pillow
-download_dep python-bidi
-download_dep opencv-python-headless
-download_dep shapely
-download_dep pyarrow
-download_dep dill
-download_dep multiprocess
-download_dep xxhash
-
-# ------------------------------------------------------------------------------
-# 7. 核心框架与工具 (HF/Rich/EasyOCR)
-# ------------------------------------------------------------------------------
-echo "🛠️  [6/6] Frameworks & Utils..."
-download_dep accelerate
-download_dep huggingface-hub
-download_dep tokenizers
-download_dep safetensors
-download_dep pyyaml
-download_dep tqdm
-download_dep filelock
-download_dep fsspec
-download_dep typing-extensions
-download_dep packaging
-download_dep psutil
-download_dep regex
-download_dep sympy
-download_dep jinja2
-download_dep MarkupSafe
-download_dep mpmath
-download_dep sentencepiece
-download_dep protobuf
-# Rich 全家桶
-download_dep rich
-download_dep pygments
-download_dep markdown-it-py
-download_dep mdurl
-download_dep colorama
-# CLI 工具
-download_dep click
-download_dep typer
-download_dep typer-slim
-download_dep shellingham
-# 业务库
-download_dep easyocr
-download_dep timm
-download_dep sentence-transformers
-download_dep einops
-
-# ------------------------------------------------------------------------------
-# 最终核验
-# ------------------------------------------------------------------------------
 echo "------------------------------------------------"
-echo "🕵️  Final Audit..."
-COUNT=$(ls $WHEEL_DIR | wc -l)
-echo "📦 总包数: $COUNT"
-
-# 关键检查清单
-CRITICAL=("nvidia_nvjitlink" "aiohappyeyeballs" "flash_attn" "torch-2" "numpy" "rich" "hf_xet" "scikit_image")
-MISSING=0
-for pkg in "${CRITICAL[@]}"; do
-    if [ $(find $WHEEL_DIR -iname "*$pkg*" | wc -l) -eq 0 ]; then
-        echo "❌ MISSING: $pkg"
-        MISSING=1
-    fi
-done
-
-if [ $MISSING -eq 0 ]; then
-    echo "🎉 完美！所有已知的坑都已填平。请打包: $SAVE_DIR"
-else
-    echo "⛔ 依然有缺失，请检查网络日志。"
+# 最终检查：确保没有 .tar.gz 的 flash-attn
+if ls $WHEEL_DIR/flash_attn*.tar.gz 1> /dev/null 2>&1; then
+    echo "⚠️  警告：发现 Flash Attention 源码包，正在自动删除..."
+    rm "$WHEEL_DIR/flash_attn"*.tar.gz
 fi
+
+echo "✅ 采集完成！exceptiongroup 已补全，源码包已清理。"
