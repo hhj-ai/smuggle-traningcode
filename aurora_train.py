@@ -21,14 +21,18 @@ from rewards import RewardCalculator
 YFCC_ROOT_DIR = "./data/yfcc100m"
 CHECKPOINT_DIR = "./output/checkpoints"
 
-# H200 Optimization: Increased Batch Size significantly
+# H200 Optimization:
 # 141GB VRAM allows massive batches.
 BATCH_SIZE = 32      # Per GPU Batch (Total = 32 * 8 = 256 images/step)
 GROUP_SIZE = 8       # Increased samples per image for better RL variance reduction
 EPOCHS = 5
 LEARNING_RATE_VLM = 1e-6
 LEARNING_RATE_VERIFIER = 1e-6
-DOWNLOAD_COUNT = 50000 # Increased default download for H200 speed
+
+# ✅ DATASET AUTO-DOWNLOAD CONFIG
+# H200 runs fast, so we need a decent amount of data.
+# The script will automatically download this many images if the folder is empty.
+DOWNLOAD_COUNT = 50000
 # -----------------------------
 
 os.makedirs(YFCC_ROOT_DIR, exist_ok=True)
@@ -45,10 +49,13 @@ class YFCCDownloader:
             async with session.get(url, timeout=timeout) as response:
                 if response.status == 200:
                     content = await response.read()
+                    # Verify image validity
                     try:
                         Image.open(BytesIO(content)).verify()
                     except:
                         return False
+                    
+                    # Save image
                     path = os.path.join(self.root_dir, f"yfcc_{idx}.jpg")
                     with open(path, "wb") as f:
                         f.write(content)
@@ -58,15 +65,17 @@ class YFCCDownloader:
         return False
 
     async def run(self):
-        print(f"🌍 Streaming YFCC100M metadata from Hugging Face...")
+        print(f"🌍 [Auto-Data] Streaming YFCC100M metadata from Hugging Face...")
         try:
+            # Using a reliable YFCC100M subset from HF
             ds = load_dataset("limingcv/YFCC100M_OpenAI_subset", split="train", streaming=True, trust_remote_code=True)
         except Exception as e:
             print(f"⚠️  Primary dataset source failed: {e}")
             print("🔄 Switching to backup source 'dbrtag/yfcc100m'...")
             ds = load_dataset("dbrtag/yfcc100m", split="train", streaming=True, trust_remote_code=True)
 
-        print(f"⬇️  Downloading {self.target_count} images to {self.root_dir}...")
+        print(f"⬇️  [Auto-Data] Downloading {self.target_count} images to {self.root_dir}...")
+        print(f"    This may take a few minutes depending on your cluster's bandwidth.")
         
         async with aiohttp.ClientSession() as session:
             tasks = []
@@ -76,12 +85,17 @@ class YFCCDownloader:
             for i, item in enumerate(ds):
                 if downloaded >= self.target_count:
                     break
-                url = item.get('url') or item.get('URL') or item.get('img_url')
+                
+                # Try different URL keys common in YFCC datasets
+                url = item.get('url') or item.get('URL') or item.get('img_url') or item.get('download_url')
                 if not url:
                     continue
+                
                 task = asyncio.create_task(self.download_image(session, url, i))
                 tasks.append(task)
-                if len(tasks) >= 200: # Increased concurrency for faster download
+                
+                # High concurrency for H200 cluster bandwidth
+                if len(tasks) >= 200:
                     results = await asyncio.gather(*tasks)
                     success_count = sum(results)
                     downloaded += success_count
@@ -93,28 +107,37 @@ class YFCCDownloader:
                 downloaded += sum(results)
                 pbar.update(sum(results))
             pbar.close()
-            print(f"✅ Download complete! {downloaded} images saved.")
+            print(f"✅ [Auto-Data] Download complete! {downloaded} images saved to {self.root_dir}.")
 
 def ensure_yfcc_data(root_dir):
+    """
+    Checks if data exists. If not, triggers the downloader.
+    """
     try:
         files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
         count = len(files)
     except FileNotFoundError:
         count = 0
+    
     if count < 100:
-        print(f"⚠️  {root_dir} is empty or low on data ({count} images found).")
-        print("🚀 Initiating Automatic Download of YFCC100M subset...")
+        print(f"⚠️  Data directory {root_dir} is empty or low on data ({count} images).")
+        print("🚀 Initiating Automatic Download Procedure...")
         downloader = YFCCDownloader(root_dir)
         asyncio.run(downloader.run())
     else:
-        print(f"✅ Found {count} existing images in {root_dir}")
+        print(f"✅ Found {count} existing images in {root_dir}. Skipping download.")
 
 class YFCCDataset(Dataset):
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.image_files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        if not self.image_files: self.use_mock = True
-        else: self.use_mock = False
+        
+        # Fallback if download failed completely (should not happen with downloader)
+        if not self.image_files:
+            print("❌ Critical Error: No images found even after download attempt.")
+            self.use_mock = True
+        else:
+            self.use_mock = False
 
     def __len__(self):
         return len(self.image_files) if not self.use_mock else 100
@@ -126,6 +149,7 @@ class YFCCDataset(Dataset):
             image = Image.open(img_path).convert("RGB")
             return image, img_path
         except Exception:
+            # Robust skip if an image is corrupted
             return self.__getitem__((idx + 1) % len(self))
 
 def collate_fn(batch):
@@ -163,12 +187,13 @@ def train():
     # H200: Enable TF32 for faster training
     torch.backends.cuda.matmul.allow_tf32 = True
     
-    accelerator = Accelerator(gradient_accumulation_steps=1) # Reduced steps since BS is large
+    accelerator = Accelerator(gradient_accumulation_steps=1)
     device = accelerator.device
     
     if accelerator.is_main_process:
         print(f"🚀 AURORA: Adversarial VLM Training Started on {torch.cuda.get_device_name(0)}")
-        print(f"   Config: Batch={BATCH_SIZE}, Group={GROUP_SIZE} (Total throughput: {BATCH_SIZE*GROUP_SIZE*accelerator.num_processes}/step)")
+        print(f"   Config: Batch={BATCH_SIZE}, Group={GROUP_SIZE}")
+        # ✅ TRIGGER AUTO-DOWNLOAD ON MAIN PROCESS
         ensure_yfcc_data(YFCC_ROOT_DIR)
     
     accelerator.wait_for_everyone()
@@ -206,7 +231,7 @@ def train():
                     vlm_generated_texts.append(diverse_descs)
             
             flat_descriptions = [d for group in vlm_generated_texts for d in group]
-            # FIXED: Correctly expand images to match flat descriptions
+            # ✅ FIXED: Correctly expand images to match flat descriptions
             flat_images = [img for img in images for _ in range(GROUP_SIZE)]
             flat_img_paths = [path for path in image_paths for _ in range(GROUP_SIZE)]
             
@@ -216,7 +241,6 @@ def train():
             verifier_correlation_scores = []
             
             with torch.no_grad():
-                # Potential Optimization: Batch this call if possible in future
                 for desc in flat_descriptions:
                     claims, raw_resp = verifier.verify_claims(desc)
                     verifier_claims_map.append(claims)
@@ -235,7 +259,7 @@ def train():
                     res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})
                 verification_results.append(res_per_desc)
 
-            # === PHASE 2: Train VLM (CRITICAL FIX APPLIED) ===
+            # === PHASE 2: Train VLM (FIXED: WITH IMAGES) ===
             vlm_optimizer.zero_grad()
             all_vlm_rewards = []
             
@@ -273,27 +297,18 @@ def train():
             
             total_vlm_loss = 0
             
-            # FIXED LOOP: Now iterates over text AND images together
+            # ✅ FIXED LOOP: Pass both text AND images to VLM for training
             for k, (text, img) in enumerate(zip(flat_descriptions, flat_images)):
-                # Construct proper Qwen-VL-Instruct prompt
+                # Construct Qwen-VL prompt
                 messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "Describe this image in detail."}
-                        ]
-                    },
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": text}]
-                    }
+                    {"role": "user", "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": "Describe this image in detail."}
+                    ]},
+                    {"role": "assistant", "content": [{"type": "text", "text": text}]}
                 ]
-                
-                # Apply chat template and process
                 text_input = vlm.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 
-                # Important: Qwen processor handles image patching
                 inputs = vlm.processor(
                     text=[text_input],
                     images=[img],
@@ -301,9 +316,7 @@ def train():
                     return_tensors="pt"
                 ).to(device)
                 
-                # Calculate Log Prob
                 log_prob = vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
-                
                 loss = -vlm_advantages[k] * log_prob
                 total_vlm_loss += loss
             
