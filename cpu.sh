@@ -1,61 +1,54 @@
 #!/bin/bash
 
 # ========================================================================
-# 1_full_download.sh (CPU 服务器 - 终极版)
-# 核心策略: 全程使用 --no-deps，禁止 pip 思考，只管下载
+# 1_full_download.sh (CPU 服务器 - 终极全量资源版)
+# 目标: 下载 Python3.10 + 依赖包 + 评测数据 + 工具权重(OCR/DINO)
+# 特性: 暴力直链下载，绕过本地 pip 版本检查
 # ========================================================================
 
+# 1. 设置目录结构
 SAVE_DIR="./offline_packages"
 PYTHON_DIR="$SAVE_DIR/python_runtime"
-WEIGHTS_DIR="$SAVE_DIR/tool_weights"  # <--- 新增工具权重目录
+WHEEL_DIR="$SAVE_DIR/wheels"
+DATA_DIR="$SAVE_DIR/datasets"
+WEIGHTS_DIR="$SAVE_DIR/tool_weights"
 
 mkdir -p $PYTHON_DIR $WHEEL_DIR $DATA_DIR $WEIGHTS_DIR
-echo "🚀 [CPU Server] 开始构建全量离线包 (No-Deps Mode)..."
 
-# ------------------------------------------------------------------------
-# 1. 下载独立版 Python 3.10
-# ------------------------------------------------------------------------
-echo "🐍 [1/6] 下载 Python 3.10 独立运行包..."
+echo "🚀 [CPU Server] 开始构建全量离线资源..."
+echo "📂 保存路径: $SAVE_DIR"
+
+# =========================================================
+# [Part A] 下载独立版 Python 3.10 (无需安装，解压即用)
+# =========================================================
+echo "🐍 [1/7] 下载 Python 3.10 Runtime..."
 PYTHON_URL="https://github.com/indygreg/python-build-standalone/releases/download/20240224/cpython-3.10.13+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz"
-
 if [ ! -f "$PYTHON_DIR/python-3.10.tar.gz" ]; then
     wget -c -O "$PYTHON_DIR/python-3.10.tar.gz" "$PYTHON_URL" || curl -L -o "$PYTHON_DIR/python-3.10.tar.gz" "$PYTHON_URL"
-else
-    echo "   ✅ Python 包已存在。"
 fi
 
-# ------------------------------------------------------------------------
-# 2. 暴力下载 PyTorch (Wget 直链)
-# ------------------------------------------------------------------------
-echo "🔥 [2/6] 暴力下载 PyTorch (CUDA 12.1)..."
-# 手动列出 URL，完全绕过 pip
+# =========================================================
+# [Part B] 暴力下载核心框架 (Wget 直链)
+# =========================================================
+echo "🔥 [2/7] 下载 PyTorch (CUDA 12.1)..."
 BASE_URL="https://download.pytorch.org/whl/cu121"
+# 直接指定 Py3.10/Linux 版本
 wget -nc -P $WHEEL_DIR "$BASE_URL/torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 wget -nc -P $WHEEL_DIR "$BASE_URL/torchvision-0.19.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 wget -nc -P $WHEEL_DIR "$BASE_URL/torchaudio-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 
-# ------------------------------------------------------------------------
-# 3. 下载 Flash Attention 2 (关键修复: 加上 --no-deps)
-# ------------------------------------------------------------------------
-echo "⚡ [3/6] 下载 Flash Attention 2..."
-# 加上 --no-deps 防止它去检查 torch 是否存在
-pip download flash-attn==2.6.3 \
-    --dest $WHEEL_DIR \
-    --index-url https://pypi.org/simple \
-    --trusted-host pypi.org \
-    --no-binary :all: \
-    --no-deps
-
-# ------------------------------------------------------------------------
-# 4. 下载 Transformers (Wget 源码 Zip)
-# ------------------------------------------------------------------------
-echo "🤗 [4/6] 下载 Transformers (GitHub Main)..."
+echo "🤗 [3/7] 下载 Transformers (GitHub Main)..."
+# 下载最新源码以支持 Qwen3-VL
 wget -nc -O "$WHEEL_DIR/transformers-main.zip" "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
 
-# ------------------------------------------------------------------------
-# 5. 下载所有通用依赖 (全部加上 --no-deps)
-# ------------------------------------------------------------------------
-echo "📚 [5/6] 下载通用依赖 (伪装 Py3.10)..."
+echo "⚡ [4/7] 下载 Flash Attention 2..."
+# 加上 --no-deps 防止检查 torch
+pip download flash-attn==2.6.3 --dest $WHEEL_DIR --index-url https://pypi.org/simple --trusted-host pypi.org --no-binary :all: --no-deps
+
+# =========================================================
+# [Part C] 下载通用依赖 (伪装 Py3.10, No-Deps)
+# =========================================================
+echo "📚 [5/7] 下载通用依赖 (伪装 Py3.10)..."
 
 download_wheel() {
     pip download "$@" \
@@ -66,118 +59,85 @@ download_wheel() {
         --python-version 3.10 \
         --platform manylinux2014_x86_64 \
         --only-binary=:all: \
-        --no-deps  # <--- 核心修改：不检查依赖，只下载指定的包
+        --no-deps
 }
 
-# 手动列出所有需要的包 (因为我们关掉了依赖检查，所以必须把依赖的依赖也写出来)
-# 基础
-download_wheel pip
-download_wheel setuptools
-download_wheel wheel
-download_wheel packaging
-download_wheel ninja
-download_wheel psutil
-
+# 基础构建工具
+download_wheel pip setuptools wheel packaging ninja psutil
+# HF 生态
+download_wheel accelerate>=0.27.0 huggingface-hub>=0.23.0 tokenizers>=0.19.1 safetensors>=0.4.1
+download_wheel regex requests filelock fsspec pyyaml tqdm
+download_wheel charset-normalizer idna urllib3 certifi
 # Torch 依赖
-download_wheel sympy
-download_wheel networkx
-download_wheel jinja2
-download_wheel MarkupSafe
-download_wheel filelock
-download_wheel typing-extensions
-download_wheel fsspec
-download_wheel mpmath
+download_wheel sympy networkx jinja2 MarkupSafe typing-extensions mpmath
+# 业务/评估工具依赖
+download_wheel datasets sentence-transformers numpy<2.0.0 Pillow easyocr scipy
+download_wheel termcolor timm rich questionary aiohttp protobuf sentencepiece
+download_wheel opencv-python-headless scikit-image python-bidi PyYAML
+download_wheel attrs multidict yarl frozenlist aiosignal async-timeout
+download_wheel pandas pytz python-dateutil six
 
-# HF 依赖
-download_wheel accelerate>=0.27.0
-download_wheel huggingface-hub>=0.23.0
-download_wheel tokenizers>=0.19.1
-download_wheel safetensors>=0.4.1
-download_wheel regex
-download_wheel requests
-download_wheel pyyaml
-download_wheel tqdm
-download_wheel charset-normalizer
-download_wheel idna
-download_wheel urllib3
-download_wheel certifi
+# =========================================================
+# [Part D] 下载评测数据集 (POPE & MMHal)
+# =========================================================
+echo "📊 [6/7] 下载评测数据集..."
 
-# 业务依赖
-download_wheel datasets
-download_wheel sentence-transformers
-download_wheel numpy<2.0.0
-download_wheel Pillow
-download_wheel easyocr
-download_wheel scipy
-download_wheel termcolor
-download_wheel timm
-download_wheel rich
-download_wheel questionary
-download_wheel aiohttp
-download_wheel protobuf
-download_wheel sentencepiece
-# easyocr 依赖
-download_wheel opencv-python-headless
-download_wheel scikit-image
-download_wheel python-bidi
-download_wheel PyYAML
-# aiohttp 依赖
-download_wheel attrs
-download_wheel multidict
-download_wheel yarl
-download_wheel frozenlist
-download_wheel aiosignal
-download_wheel async-timeout
+# POPE
+mkdir -p "$DATA_DIR/pope"
+POPE_URL="https://huggingface.co/datasets/shiyue/POPE/resolve/main/output/coco/coco_pope_random.json"
+wget -c -O "$DATA_DIR/pope/coco_pope_random.json" "$POPE_URL"
 
+# MMHal-Bench & Sentence Transformers (需下载文件夹)
+# 我们尝试安装一个临时的 huggingface_hub 来下载 (如果当前环境能装的话)
+echo "   ... 尝试安装 huggingface_hub 用于下载数据 ..."
+pip install huggingface_hub -i https://pypi.org/simple --trusted-host pypi.org >/dev/null 2>&1
+
+cat <<EOF > download_data_repos.py
+import os
+from huggingface_hub import snapshot_download
+
+def dl(repo, local):
+    try:
+        print(f"   ⬇️  Downloading {repo}...")
+        snapshot_download(repo_id=repo, repo_type="dataset", local_dir=local, resume_download=True)
+    except Exception as e: print(f"   ❌ Error {repo}: {e}")
+
+def dl_model(repo, local):
+    try:
+        print(f"   ⬇️  Downloading Model {repo}...")
+        snapshot_download(repo_id=repo, local_dir=local, resume_download=True)
+    except Exception as e: print(f"   ❌ Error {repo}: {e}")
+
+# MMHal
+dl("Shengcao1006/MMHal-Bench", "$DATA_DIR/mmhal_bench")
+
+# Sentence Transformers (用于评估脚本)
+dl_model("sentence-transformers/all-MiniLM-L6-v2", "$WEIGHTS_DIR/sentence-transformers/all-MiniLM-L6-v2")
+EOF
+
+python3 download_data_repos.py
+rm download_data_repos.py
+
+# =========================================================
+# [Part E] 下载工具权重 (OCR & DINO)
+# =========================================================
 echo "🛠️  [7/7] 下载工具权重 (OCR & DINO)..."
 
-# 7.1 EasyOCR 权重
-# EasyOCR 运行时会去 ~/.EasyOCR/model/ 下找这两个文件
-echo "   ⬇️  EasyOCR Models..."
+# EasyOCR
 OCR_DIR="$WEIGHTS_DIR/easyocr"
 mkdir -p $OCR_DIR
-
-# 下载检测模型 (CRAFT)
 wget -nc -O "$OCR_DIR/craft_mlt_25k.zip" "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/craft_mlt_25k.zip"
-unzip -o "$OCR_DIR/craft_mlt_25k.zip" -d "$OCR_DIR"
-rm "$OCR_DIR/craft_mlt_25k.zip"
-
-# 下载识别模型 (English)
+unzip -o -q "$OCR_DIR/craft_mlt_25k.zip" -d "$OCR_DIR"
 wget -nc -O "$OCR_DIR/english_g2.zip" "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip"
-unzip -o "$OCR_DIR/english_g2.zip" -d "$OCR_DIR"
-rm "$OCR_DIR/english_g2.zip"
+unzip -o -q "$OCR_DIR/english_g2.zip" -d "$OCR_DIR"
+rm "$OCR_DIR"/*.zip
 
-# 7.2 GroundingDINO 权重 (用于目标检测/验证)
-# 通常代码会加载 groundingdino_swint_ogc.pth
-echo "   ⬇️  GroundingDINO Weights..."
+# GroundingDINO
 DINO_DIR="$WEIGHTS_DIR/dino"
 mkdir -p $DINO_DIR
-
-# 下载权重
 wget -nc -P $DINO_DIR "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
-
-# 下载配置文件 (有些库需要本地有 config 文件)
 wget -nc -P $DINO_DIR "https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 
-# 7.3 Sentence Transformers (如果你的评估代码用到了相似度计算)
-# 这是一个常见的隐形依赖
-echo "   ⬇️  Sentence Transformers (all-MiniLM-L6-v2)..."
-ST_DIR="$WEIGHTS_DIR/sentence-transformers"
-mkdir -p $ST_DIR
-# 使用 huggingface snapshot 下载 (借用之前的脚本逻辑)
-cat <<EOF > download_st.py
-from huggingface_hub import snapshot_download
-try:
-    snapshot_download(repo_id="sentence-transformers/all-MiniLM-L6-v2", local_dir="$ST_DIR/all-MiniLM-L6-v2")
-    print("   ✅ SentenceTransformer downloaded.")
-except: pass
-EOF
-python3 download_st.py
-rm download_st.py
-
 echo "------------------------------------------------"
-echo "✅ 所有资源准备完毕！"
-echo "📂 检查权重目录: $WEIGHTS_DIR"
-echo "   ├── easyocr/ (craft_mlt_25k.pth, english_g2.pth)"
-echo "   ├── dino/ (groundingdino_swint_ogc.pth)"
-echo "   └── sentence-transformers/"
+echo "✅ 全量资源准备完毕！"
+echo "👉 请将 offline_packages 目录对 GPU 服务器可见。"
