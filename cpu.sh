@@ -15,12 +15,19 @@ mkdir -p $WHEEL_DIR
 echo "🚀 [CPU Server] 开始构建全量离线包 (暴力直链版)..."
 
 # ------------------------------------------------------------------------
-# 1. 下载独立版 Python 3.10
+# 1. 下载独立版 Python 3.10 (Standalone Build)
 # ------------------------------------------------------------------------
 echo "🐍 [1/5] 下载 Python 3.10 独立运行包..."
-# 使用 curl -L -O 确保处理重定向，并保存到指定目录
+# Indygreg 提供的独立 Python 包，解压即用，不依赖系统环境
+PYTHON_URL="https://github.com/indygreg/python-build-standalone/releases/download/20240224/cpython-3.10.13+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz"
+
 if [ ! -f "$PYTHON_DIR/python-3.10.tar.gz" ]; then
-    curl -L -o "$PYTHON_DIR/python-3.10.tar.gz" "https://github.com/indygreg/python-build-standalone/releases/download/20240224/cpython-3.10.13+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz"
+    wget -O "$PYTHON_DIR/python-3.10.tar.gz" "$PYTHON_URL"
+    # 如果 wget 失败尝试 curl
+    if [ $? -ne 0 ]; then
+        echo "⚠️ wget 失败，尝试 curl..."
+        curl -L -o "$PYTHON_DIR/python-3.10.tar.gz" "$PYTHON_URL"
+    fi
 else
     echo "   ✅ Python 包已存在。"
 fi
@@ -30,18 +37,19 @@ fi
 # ------------------------------------------------------------------------
 echo "🔥 [2/5] 暴力下载 PyTorch (CUDA 12.1)..."
 # 这里的 URL 是 PyTorch 官方仓库中对应 Python 3.10 + CUDA 12.1 的真实地址
-# 避免 pip download 因为平台标签不匹配而报错
+# %2B 是 URL 编码的 + 号
 TORCH_URL="https://download.pytorch.org/whl/cu121/torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 VISION_URL="https://download.pytorch.org/whl/cu121/torchvision-0.19.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 AUDIO_URL="https://download.pytorch.org/whl/cu121/torchaudio-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"
 
+# 使用 wget 下载 (-nc 表示如果文件存在就不重新下载)
 wget -nc -P $WHEEL_DIR $TORCH_URL
 wget -nc -P $WHEEL_DIR $VISION_URL
 wget -nc -P $WHEEL_DIR $AUDIO_URL
 
 # 如果服务器没装 wget，用 curl 替补
 if [ ! -f "$WHEEL_DIR/torch-2.4.1+cu121-cp310-cp310-linux_x86_64.whl" ]; then
-    echo "⚠️ wget 不可用，尝试 curl..."
+    echo "⚠️ wget 不可用或下载失败，尝试 curl..."
     curl -L -o "$WHEEL_DIR/torch-2.4.1+cu121-cp310-cp310-linux_x86_64.whl" $TORCH_URL
     curl -L -o "$WHEEL_DIR/torchvision-0.19.1+cu121-cp310-cp310-linux_x86_64.whl" $VISION_URL
     curl -L -o "$WHEEL_DIR/torchaudio-2.4.1+cu121-cp310-cp310-linux_x86_64.whl" $AUDIO_URL
@@ -51,16 +59,18 @@ fi
 # 3. 下载 Transformers (Wget 源码 Zip，最稳妥)
 # ------------------------------------------------------------------------
 echo "🤗 [3/5] 下载 Transformers (GitHub Main)..."
-wget -nc -O "$WHEEL_DIR/transformers-main.zip" "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
-# 替补 curl
+TRANSFORMERS_URL="https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
+
+wget -nc -O "$WHEEL_DIR/transformers-main.zip" "$TRANSFORMERS_URL"
 if [ ! -f "$WHEEL_DIR/transformers-main.zip" ]; then
-    curl -L -o "$WHEEL_DIR/transformers-main.zip" "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
+    curl -L -o "$WHEEL_DIR/transformers-main.zip" "$TRANSFORMERS_URL"
 fi
 
 # ------------------------------------------------------------------------
 # 4. 下载 Flash Attention 2 (通用源码包)
 # ------------------------------------------------------------------------
 echo "⚡ [4/5] 下载 Flash Attention 2..."
+# Flash Attention 源码包不区分 Python 版本，可以用 pip download
 pip download flash-attn==2.6.3 \
     --dest $WHEEL_DIR \
     --index-url https://pypi.org/simple \
@@ -71,9 +81,9 @@ pip download flash-attn==2.6.3 \
 # ------------------------------------------------------------------------
 # 5. 下载其他通用依赖 (使用 pip download，但放宽限制)
 # ------------------------------------------------------------------------
-echo "📚 [5/5] 下载通用依赖 (Py3.10)..."
+echo "📚 [5/5] 下载通用依赖 (伪装 Py3.10)..."
 
-# 定义下载函数：指定 Py3.10
+# 定义下载函数：指定 Py3.10 和官方源
 download_wheel() {
     pip download "$@" \
         --dest $WHEEL_DIR \
@@ -124,5 +134,5 @@ download_wheel urllib3
 download_wheel certifi
 
 echo "------------------------------------------------"
-echo "✅ 暴力下载完成！请检查 $WHEEL_DIR 下是否有 .whl 文件"
-echo "👉 请切换到 GPU 服务器运行 2_full_install.sh"
+echo "✅ 暴力下载完成！"
+echo "📂 请检查 $WHEEL_DIR 下是否有 .whl 文件"
