@@ -1,73 +1,72 @@
 #!/bin/bash
 
 # ==========================================
-# AURORA Environment Setup (Enterprise Fixed)
-# Strategy: Use venv + Trust Internal Mirror
+# AURORA Environment Setup (Step-by-Step)
+# 解决卡在 "Installing collected packages" 的问题
 # ==========================================
 
 ENV_NAME="aurora_env"
-# 自动获取当前内网源地址（从报错日志里提取的）
+# 内网源配置
 PIP_INDEX_URL="http://pip.sankuai.com/simple/"
 PIP_TRUSTED_HOST="pip.sankuai.com"
 
-echo "🚀 Starting Robust Environment Setup..."
+echo "🚀 启动分步安装脚本..."
 
-# 1. 清理旧环境 (如果有残留)
-rm -rf $ENV_NAME
-
-# 2. 创建虚拟环境 (使用 venv 代替 conda)
-echo "📦 Creating virtual environment using 'venv'..."
-# 尝试使用 python3 或 python
-PYTHON_CMD="python3"
-if ! command -v python3 &> /dev/null; then
-    PYTHON_CMD="python"
-fi
-
-$PYTHON_CMD -m venv $ENV_NAME
-
+# 1. 检查或创建环境
 if [ ! -d "$ENV_NAME" ]; then
-    echo "❌ Failed to create venv. Please check your python installation."
-    exit 1
+    echo "📦 创建虚拟环境..."
+    python3 -m venv $ENV_NAME
 fi
 
-# 3. 激活环境
-echo "🔌 Activating environment..."
+# 2. 激活环境
 source $ENV_NAME/bin/activate
+echo "🔌 环境已激活: $(which python)"
 
-# 确认激活成功
-WHICH_PYTHON=$(which python)
-echo "   -> Python path: $WHICH_PYTHON"
-if [[ "$WHICH_PYTHON" != *"$ENV_NAME"* ]]; then
-    echo "❌ Activation failed!"
-    exit 1
-fi
-
-# 定义带信任参数的 pip 函数
+# 定义 PIP 函数 (带信任 + 无缓存 + 详细输出)
+# -v: 显示详细进度，防止看着像卡死
+# --no-cache-dir: 节省空间，减少解压时的 IO
 run_pip() {
-    python -m pip install "$@" --index-url $PIP_INDEX_URL --trusted-host $PIP_TRUSTED_HOST
+    python -m pip install "$@" \
+        --index-url $PIP_INDEX_URL \
+        --trusted-host $PIP_TRUSTED_HOST \
+        --no-cache-dir \
+        -v
 }
 
-# 4. 升级 pip 和基础工具
-echo "🔧 Upgrading pip and build tools..."
-run_pip --upgrade pip wheel setuptools
+# 定义简易 PIP (不带 -v，用于小包)
+run_pip_quiet() {
+    python -m pip install "$@" \
+        --index-url $PIP_INDEX_URL \
+        --trusted-host $PIP_TRUSTED_HOST \
+        --no-cache-dir
+}
 
-# 5. 手动安装构建依赖 (解决 flash-attn 编译报错的关键)
-echo "🧱 Installing build dependencies (psutil, ninja)..."
-run_pip psutil ninja packaging
+# 3. 升级基础工具
+echo "🔧 [1/6] 升级 pip..."
+run_pip_quiet --upgrade pip wheel setuptools
 
-# 6. 安装 PyTorch (指定版本)
-echo "🔥 Installing PyTorch..."
-# 内网源通常会自动匹配合适的 CUDA 版本，如果不行再手动指定
-run_pip torch torchvision torchaudio
+# 4. 单独安装 PyTorch (最大的包，最容易卡)
+echo "🔥 [2/6] 单独安装 PyTorch (由大到小)..."
+echo "    注意：屏幕会疯狂滚动日志，这是正常的，说明在解压..."
+# 先装 torch
+run_pip torch
 
-# 7. 安装 Flash Attention 2 (关键步骤)
-echo "⚡ Installing Flash Attention 2..."
-# 使用 --no-build-isolation 强制使用我们刚才手动安装的 psutil/ninja
+# 5. 安装 Vision 和 Audio
+echo "📷 [3/6] 安装 TorchVision & TorchAudio..."
+run_pip torchvision torchaudio
+
+# 6. 安装构建依赖
+echo "🧱 [4/6] 安装构建工具 (ninja, psutil)..."
+run_pip_quiet psutil ninja packaging
+
+# 7. 安装 Flash Attention
+echo "⚡ [5/6] 安装 Flash Attention 2..."
+# 这一步需要编译，可能会慢，保持耐心
 run_pip flash-attn --no-build-isolation
 
-# 8. 安装其他依赖
-echo "📚 Installing remaining dependencies..."
-run_pip \
+# 8. 安装其余依赖
+echo "📚 [6/6] 安装剩余依赖..."
+run_pip_quiet \
     "transformers>=4.38.0" \
     "accelerate>=0.27.0" \
     datasets \
@@ -87,5 +86,5 @@ run_pip \
     sentencepiece
 
 echo "------------------------------------------------"
-echo "🎉 Environment Setup Complete!"
-echo "👉 To activate, run: source $ENV_NAME/bin/activate"
+echo "🎉 安装全部完成！没有卡死！"
+echo "👉 请运行: source $ENV_NAME/bin/activate"
