@@ -1,134 +1,188 @@
 import torch
 import re
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoTokenizer, 
+    AutoProcessor, 
+    AutoConfig
+)
+
+# ==============================================================================
+# [Critical Hotfix] 强制注册 Qwen3-VL 配置
+# ------------------------------------------------------------------------------
+# 解决报错: ValueError: Unrecognized configuration class ... Qwen3VLConfig
+# 原因: Transformers 开发版虽然包含了 Qwen3 代码，但可能未正确注册到全局 AutoConfig 映射中。
+# ==============================================================================
+try:
+    # 尝试直接从 transformers 内部导入 Qwen3 的相关类
+    # 注意：如果你安装的是 transformers-main.zip，这些类应该存在
+    try:
+        from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLCausalLM
+        
+        # 1. 告诉 AutoConfig: "qwen3_vl" 这个字符串对应 Qwen2VLConfig (架构兼容)
+        # 或者如果有 Qwen3VLConfig 就用 Qwen3 的
+        try:
+            from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+            AutoConfig.register("qwen3_vl", Qwen3VLConfig)
+            print("✅ [Models] Successfully registered 'qwen3_vl' with Qwen3VLConfig.")
+        except ImportError:
+            # 如果还没发布 Qwen3VLConfig，则用 Qwen2VLConfig (完全兼容)
+            AutoConfig.register("qwen3_vl", Qwen2VLConfig)
+            print("⚠️ [Models] Qwen3VLConfig not found. Fallback: registered 'qwen3_vl' with Qwen2VLConfig.")
+
+        # 2. 告诉 AutoModel: Qwen3VLConfig 对应的模型类是 Qwen2VLCausalLM (或者 Qwen3VLCausalLM)
+        try:
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLM
+            AutoModelForCausalLM.register(Qwen3VLConfig, Qwen3VLCausalLM)
+        except (ImportError, NameError):
+            AutoModelForCausalLM.register(Qwen2VLConfig, Qwen2VLCausalLM)
+            
+    except ImportError as e:
+        print(f"⚠️ [Models] Registration Hotfix failed: {e}. Relying on AutoClasses default behavior.")
+
+except Exception as e:
+    print(f"⚠️ [Models] Unknown error during registration hotfix: {e}")
+# ==============================================================================
+
 
 class VerifierModel:
-    """
-    Wrapper for Verifier (DeepSeek-R1-Distill-Qwen-7B).
-    Standard loading with Flash Attention 2.
-    """
     def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
         self.device = device
+        # 路径回退检查
+        if not os.path.exists(model_name) and "models/" in model_name:
+             # 如果本地没找到，尝试用 huggingface ID (用户可能没下载完)
+             print(f"⚠️ Local path {model_name} not found, trying HuggingFace ID...")
+             model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
         
-        # 1. 路径检查 (本地优先，远程回退)
-        if not os.path.exists(model_name):
-            print(f"⚠️ Warning: Local model path '{model_name}' not found. Fallback to HF ID.")
-            if "models/" in model_name: 
-                model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-        
-        print(f"Loading Verifier from: {model_name} ...")
-        
-        # 2. 加载 Tokenizer
+        print(f"Loading Verifier: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
-        # 3. 加载模型
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": device}, # 适配 Accelerator
-            trust_remote_code=True,
+            model_name, 
+            torch_dtype=torch.bfloat16, 
+            device_map={"": device}, 
+            trust_remote_code=True, 
             attn_implementation="flash_attention_2"
         )
+        self.model.eval() # 确保进入推理模式
 
     def verify_claims(self, description):
         """
-        生成验证点 (Claims)
+        Generates extraction of claims from the description.
         """
         prompt = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {description}\n\nClaims:"
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=True,
-            temperature=0.6
-        )
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, 
+                max_new_tokens=512, 
+                do_sample=True, 
+                temperature=0.6,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+            
+        raw = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
         
-        raw_response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        # 清洗 DeepSeek 的思维链标签 (如果有)
+        clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         
-        # 清理思维链 (DeepSeek R1 特性)
-        clean_text = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
-        
-        claims = []
-        for line in clean_text.split('\n'):
-            # 简单的清洗逻辑
-            cleaned = line.strip().lstrip('-').lstrip('*').strip()
-            if len(cleaned) > 5:
-                claims.append(cleaned)
-                
-        return claims, raw_response
+        claims = [line.strip().lstrip('-*').strip() for line in clean.split('\n') if len(line.strip()) > 5]
+        return claims, raw
 
     def compute_sequence_log_prob(self, prompt, completion):
         """
-        计算生成序列的对数概率 (用于 PPO/DPO 训练)
+        Computes the log probability of the completion given the prompt.
         """
-        full_prompt = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {prompt}\n\nClaims:"
-        full_text = full_prompt + completion
+        full_text = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {prompt}\n\nClaims:" + completion
         
         inputs = self.tokenizer(full_text, return_tensors="pt").to(self.device)
         labels = inputs.input_ids.clone()
         
-        # Mask 掉 Prompt 部分的 Loss，只计算 Completion 部分
-        prompt_ids = self.tokenizer(full_prompt, return_tensors="pt").input_ids
-        safe_len = min(prompt_ids.shape[1], labels.shape[1])
-        labels[:, :safe_len] = -100
+        # Mask out the prompt part for loss calculation
+        prompt_text = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {prompt}\n\nClaims:"
+        prompt_len = self.tokenizer(prompt_text, return_tensors="pt").input_ids.shape[1]
         
-        outputs = self.model(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            labels=labels
-        )
+        # Ensure we don't mask everything if tokenization length varies slightly
+        mask_len = min(prompt_len, labels.shape[1])
+        labels[:, :mask_len] = -100
         
-        # 计算平均 Log Prob
-        valid_token_count = (labels != -100).sum().item()
-        if valid_token_count == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=inputs.input_ids, 
+                attention_mask=inputs.attention_mask, 
+                labels=labels
+            )
+        
+        # Valid tokens for normalization
+        valid_tokens = (labels != -100).sum()
+        if valid_tokens == 0:
+            return torch.tensor(0.0).to(self.device)
             
-        return -outputs.loss * valid_token_count
+        return -outputs.loss * valid_tokens
+
 
 class VLMModel:
-    """
-    Wrapper for VLM (Qwen3-VL-8B-Instruct).
-    Standard loading (Requires latest transformers library).
-    """
     def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda"):
         self.device = device
+        if not os.path.exists(model_name) and "models/" in model_name:
+             print(f"⚠️ Local path {model_name} not found, trying HuggingFace ID...")
+             model_name = "Qwen/Qwen2.5-VL-7B-Instruct" # Fallback if Qwen3 path is wrong
+             
+        print(f"Loading VLM: {model_name}")
         
-        # 1. 路径检查
-        if not os.path.exists(model_name):
-            print(f"⚠️ Warning: Local model path '{model_name}' not found. Fallback to HF ID.")
-            if "models/" in model_name:
-                model_name = "Qwen/Qwen3-VL-8B-Instruct"
-
-        print(f"Loading VLM from: {model_name} ...")
-        
+        # Qwen-VL 系列通常需要 trust_remote_code=True 且 min_pixels/max_pixels 设置
         try:
-            # 2. 加载 Processor
-            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-            
-            # 3. 加载模型
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                device_map={"": device},
+            self.processor = AutoProcessor.from_pretrained(
+                model_name, 
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2"
+                min_pixels=256*28*28, 
+                max_pixels=1280*28*28
             )
-            
-        except Exception as e:
-            print(f"❌ VLM Load Error: {e}")
-            raise RuntimeError(f"VLM Load Error: {e}")
-            
+        except Exception:
+            # Fallback for standard loading
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2"
+        )
+        self.model.eval()
         self.tokenizer = self.processor.tokenizer
 
     def generate_description_batch(self, image_inputs, num_generations=4):
         """
-        批量生成图片描述
+        Generates descriptions for a batch of images using Qwen-VL prompt format.
         """
-        text_prompts = ["Describe this image in detail."] * len(image_inputs)
+        # Qwen-VL 标准 Prompt 格式
+        # 注意: 这里的实现假设 image_inputs 是 PIL Images 列表
+        
+        messages_batch = []
+        for _ in image_inputs:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": None}, # 占位符, processor 会处理
+                        {"type": "text", "text": "Describe this image in detail."}
+                    ]
+                }
+            ]
+            messages_batch.append(messages)
+
+        # 准备 inputs (Qwen2.5/3 VL 的 processor 处理方式)
+        text_prompts = [
+            self.processor.apply_chat_template(msg, add_generation_prompt=True) 
+            for msg in messages_batch
+        ]
         
         inputs = self.processor(
             text=text_prompts,
@@ -136,38 +190,39 @@ class VLMModel:
             padding=True,
             return_tensors="pt"
         ).to(self.device)
-        
+
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=256,
                 do_sample=True,
                 temperature=1.0,
                 num_return_sequences=num_generations
             )
+
+        # Decode output
+        # Qwen generate 输出包含 input，需要截断
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids.repeat_interleave(num_generations, dim=0), generated_ids)
+        ]
         
-        generated_texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+        texts = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
         
-        # 重组结果: [batch_size, num_generations]
-        results = []
-        for i in range(len(image_inputs)):
-            start = i * num_generations
-            results.append(generated_texts[start : start + num_generations])
-            
-        return results
+        # Reshape: [batch_size, num_generations]
+        reshaped_texts = [
+            texts[i * num_generations : (i + 1) * num_generations] 
+            for i in range(len(image_inputs))
+        ]
+        return reshaped_texts
 
     def compute_log_probs(self, input_ids, attention_mask, labels):
         """
-        计算 VLM 的 Loss (用于 PPO Update)
+        Wraps model forward pass for log probability computation.
         """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-        
-        valid_count = (labels != -100).sum().item()
-        if valid_count == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-            
-        return -outputs.loss * valid_count
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                labels=labels
+            )
+        return -outputs.loss * (labels != -100).sum()
