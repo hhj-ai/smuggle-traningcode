@@ -1,48 +1,75 @@
 #!/bin/bash
 
 # ==========================================
-# AURORA Environment Setup (H200 Optimized)
-# Creates Conda env & Installs Dependencies
+# AURORA Environment Setup (Enterprise Fixed)
+# Strategy: Use venv + Trust Internal Mirror
 # ==========================================
 
 ENV_NAME="aurora_env"
+# 自动获取当前内网源地址（从报错日志里提取的）
+PIP_INDEX_URL="http://pip.sankuai.com/simple/"
+PIP_TRUSTED_HOST="pip.sankuai.com"
 
-echo "🚀 Setting up Conda Environment: $ENV_NAME"
+echo "🚀 Starting Robust Environment Setup..."
 
-# 1. 检查 Conda
-if ! command -v conda &> /dev/null; then
-    echo "❌ Conda could not be found. Please install Anaconda/Miniconda first."
+# 1. 清理旧环境 (如果有残留)
+rm -rf $ENV_NAME
+
+# 2. 创建虚拟环境 (使用 venv 代替 conda)
+echo "📦 Creating virtual environment using 'venv'..."
+# 尝试使用 python3 或 python
+PYTHON_CMD="python3"
+if ! command -v python3 &> /dev/null; then
+    PYTHON_CMD="python"
+fi
+
+$PYTHON_CMD -m venv $ENV_NAME
+
+if [ ! -d "$ENV_NAME" ]; then
+    echo "❌ Failed to create venv. Please check your python installation."
     exit 1
 fi
 
-# 2. 创建环境 (Python 3.10 是目前兼容性最好的版本)
-echo "📦 Creating environment..."
-conda create -n $ENV_NAME python=3.10 -y
-
 # 3. 激活环境
-# 注意：在 shell 脚本中激活 conda 需要 source
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate $ENV_NAME
+echo "🔌 Activating environment..."
+source $ENV_NAME/bin/activate
 
-echo "✅ Environment activated: $(which python)"
+# 确认激活成功
+WHICH_PYTHON=$(which python)
+echo "   -> Python path: $WHICH_PYTHON"
+if [[ "$WHICH_PYTHON" != *"$ENV_NAME"* ]]; then
+    echo "❌ Activation failed!"
+    exit 1
+fi
 
-# 4. 安装 PyTorch (CUDA 12.1 for H200)
-echo "🔥 Installing PyTorch (CUDA 12.1)..."
-pip install torch torchvision torchaudio
+# 定义带信任参数的 pip 函数
+run_pip() {
+    python -m pip install "$@" --index-url $PIP_INDEX_URL --trusted-host $PIP_TRUSTED_HOST
+}
 
-# 5. 安装构建工具 (FlashAttn 需要)
-echo "🔧 Installing build tools..."
-pip install packaging ninja
+# 4. 升级 pip 和基础工具
+echo "🔧 Upgrading pip and build tools..."
+run_pip --upgrade pip wheel setuptools
 
-# 6. 安装 Flash Attention 2 (H200 核心加速库)
-echo "⚡ Installing Flash Attention 2 (This may take a while to compile)..."
-pip install flash-attn --no-build-isolation
+# 5. 手动安装构建依赖 (解决 flash-attn 编译报错的关键)
+echo "🧱 Installing build dependencies (psutil, ninja)..."
+run_pip psutil ninja packaging
 
-# 7. 安装其他核心依赖
-echo "📚 Installing dependencies..."
-pip install \
-    transformers>=4.38.0 \
-    accelerate>=0.27.0 \
+# 6. 安装 PyTorch (指定版本)
+echo "🔥 Installing PyTorch..."
+# 内网源通常会自动匹配合适的 CUDA 版本，如果不行再手动指定
+run_pip torch torchvision torchaudio
+
+# 7. 安装 Flash Attention 2 (关键步骤)
+echo "⚡ Installing Flash Attention 2..."
+# 使用 --no-build-isolation 强制使用我们刚才手动安装的 psutil/ninja
+run_pip flash-attn --no-build-isolation
+
+# 8. 安装其他依赖
+echo "📚 Installing remaining dependencies..."
+run_pip \
+    "transformers>=4.38.0" \
+    "accelerate>=0.27.0" \
     datasets \
     huggingface_hub \
     sentence-transformers \
@@ -59,11 +86,6 @@ pip install \
     protobuf \
     sentencepiece
 
-# 8. 安装 GroundingDINO (如果不方便编译，先跳过，用 easyocr 和 clip 顶替)
-# 如果 tools.py 强依赖 GroundingDINO，取消下面注释：
-# echo "🦖 Installing GroundingDINO..."
-# pip install git+https://github.com/IDEA-Research/GroundingDINO.git
-
 echo "------------------------------------------------"
 echo "🎉 Environment Setup Complete!"
-echo "👉 To start using, run: conda activate $ENV_NAME"
+echo "👉 To activate, run: source $ENV_NAME/bin/activate"
