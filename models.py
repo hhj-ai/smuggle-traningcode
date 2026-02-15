@@ -5,61 +5,27 @@ from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer, 
     AutoProcessor, 
-    AutoConfig,
-    AutoModel
+    AutoConfig
 )
 
 # ==============================================================================
-# [Critical Hotfix v4] Qwen3-VL 动态类伪装
+# [Strategy] Direct Class Loading
 # ------------------------------------------------------------------------------
-# 解决报错: "The model class you are passing has a config_class attribute that is not consistent"
-# 原理: 动态创建一个继承自 Qwen2VL 的新类，但强行将其 config_class 指向 Qwen3VLConfig
+# 既然原生类存在，直接引用类进行加载，绕过 AutoModel 的配置映射地狱。
 # ==============================================================================
+Qwen3VLClass = None
 try:
-    print("🛠️  Applying Qwen3-VL Dynamic Class Hotfix...")
-
-    # 1. 获取基座类 (Qwen2VL)
-    from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
-    
-    # 2. 获取目标配置 (Qwen3VLConfig)
+    # 尝试直接导入 Qwen3VL 的模型类
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+    Qwen3VLClass = Qwen3VLForConditionalGeneration
+    print("✅ [Models] Using native Qwen3VLForConditionalGeneration for loading.")
+except ImportError:
+    print("⚠️ [Models] Qwen3VL native class not found. Trying Qwen2VL fallback...")
     try:
-        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-        TargetConfig = Qwen3VLConfig
-        print("   -> Found native Qwen3VLConfig.")
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+        Qwen3VLClass = Qwen2VLForConditionalGeneration
     except ImportError:
-        TargetConfig = Qwen2VLConfig
-        print("   -> Qwen3VLConfig missing, falling back to Qwen2VLConfig.")
-
-    # 3. 尝试获取原生 Qwen3 模型类，如果失败，则进行动态伪装
-    try:
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-        TargetModel = Qwen3VLForConditionalGeneration
-        print("   -> Found native Qwen3VLForConditionalGeneration.")
-    except ImportError:
-        print("   ⚠️ Native Qwen3VL model class missing. Creating dynamic proxy...")
-        
-        # [核心魔法] 动态定义一个类，继承 Qwen2VL 的实现，但绑定 Qwen3VL 的配置
-        class Qwen3VLForConditionalGeneration_Hotfix(Qwen2VLForConditionalGeneration):
-            config_class = TargetConfig
-            
-        TargetModel = Qwen3VLForConditionalGeneration_Hotfix
-
-    # 4. 执行注册 (AutoModelForCausalLM)
-    # 因为我们修改了 config_class，这里的校验现在会通过
-    try:
-        AutoConfig.register("qwen3_vl", TargetConfig)
-    except ValueError:
-        pass # Ignore "already registered" error
-
-    AutoModelForCausalLM.register(TargetConfig, TargetModel)
-    AutoModel.register(TargetConfig, TargetModel)
-    
-    print(f"✅ [Models] Successfully mapped 'qwen3_vl' Config to {TargetModel.__name__}")
-
-except Exception as e:
-    print(f"❌ [Models] Registration failed: {e}")
-    # 不退出，让后续代码碰运气
+        print("❌ [Models] Critical: No compatible QwenVL model class found!")
 
 # ==============================================================================
 
@@ -74,6 +40,7 @@ class VerifierModel:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
+        # Verifier 通常是标准语言模型，AutoModel 没问题
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, 
             torch_dtype=torch.bfloat16, 
@@ -110,16 +77,17 @@ class VerifierModel:
         
         with torch.no_grad():
             outputs = self.model(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, labels=labels)
-        
+            
         valid_tokens = (labels != -100).sum()
         if valid_tokens == 0: return torch.tensor(0.0).to(self.device)
         return -outputs.loss * valid_tokens
+
 
 class VLMModel:
     def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda"):
         self.device = device
         if not os.path.exists(model_name) and "models/" in model_name:
-             print(f"⚠️ Local path {model_name} not found, using fallback...")
+             print(f"⚠️ Local path {model_name} not found.")
         
         print(f"Loading VLM: {model_name}")
         
@@ -133,14 +101,27 @@ class VLMModel:
         except Exception:
             self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-        # 这里的 AutoModelForCausalLM 会自动使用我们上方注册的 Hotfix 类
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": device},
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2"
-        )
+        # 核心修改：使用具体类 Qwen3VLClass 而不是 AutoModelForCausalLM
+        if Qwen3VLClass:
+            print(f"🔹 Using direct class loading: {Qwen3VLClass.__name__}")
+            self.model = Qwen3VLClass.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map={"": device},
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2"
+            )
+        else:
+            # 最后的兜底
+            print("🔸 Fallback to AutoModelForCausalLM")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map={"": device},
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2"
+            )
+            
         self.model.eval()
         self.tokenizer = self.processor.tokenizer
 
