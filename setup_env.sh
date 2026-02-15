@@ -28,7 +28,7 @@ echo "✅ Environment activated: $(which python)"
 
 # 4. 安装 PyTorch (CUDA 12.1 for H200)
 echo "🔥 Installing PyTorch (CUDA 12.1)..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision torchaudio
 
 # 5. 安装构建工具 (FlashAttn 需要)
 echo "🔧 Installing build tools..."
