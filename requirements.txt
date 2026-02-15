@@ -1,0 +1,22 @@
+torch>=2.1.0
+transformers>=4.38.0
+accelerate>=0.27.0
+numpy
+Pillow
+easyocr
+scipy
+termcolor
+timm
+# For Grounding DINO
+protobuf
+sentencepiece
+# For Visual CLI
+rich
+questionary
+# Dataset & Downloading
+datasets
+aiohttp
+requests
+# Missing Dependencies Added
+sentence-transformers
+flash-attn>=2.0.0
