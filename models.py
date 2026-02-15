@@ -1,7 +1,15 @@
 import torch
 import re
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, AutoConfig
+
+# [CRITICAL PATCH] Register Qwen3-VL config if missing
+try:
+    from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration
+    AutoConfig.register("qwen3_vl", Qwen2VLConfig)
+    AutoModelForCausalLM.register(Qwen2VLConfig, Qwen2VLForConditionalGeneration)
+except ImportError:
+    pass # If Qwen2VL is also missing, we rely on trust_remote_code
 
 class VerifierModel:
     """
@@ -11,10 +19,8 @@ class VerifierModel:
     def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
         self.device = device
         
-        # Check if local path exists, otherwise warn or fallback
         if not os.path.exists(model_name):
             print(f"⚠️ Warning: Local model path '{model_name}' not found. Attempting HF download/cache...")
-            # Fallback to ID if local missing (optional, but good for safety)
             if "models/" in model_name: 
                 model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
         
@@ -24,7 +30,7 @@ class VerifierModel:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            device_map={"": device}, # Accelerator safe map
+            device_map={"": device}, 
             trust_remote_code=True,
             attn_implementation="flash_attention_2"
         )
@@ -43,7 +49,6 @@ class VerifierModel:
         )
         
         raw_response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        # Remove <think> tags for claim extraction
         clean_text = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
         
         claims = []
@@ -95,20 +100,31 @@ class VLMModel:
         print(f"Loading VLM from: {model_name} ...")
         
         try:
+            # [FIX] Manually load config to inspect/patch model_type if needed
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            
+            # 强制回退到 qwen2_vl 处理逻辑 (Qwen3-VL 通常兼容 Qwen2-VL 的代码)
+            if getattr(config, "model_type", "") == "qwen3_vl":
+                 print("⚠️ Detected 'qwen3_vl' model type. Patching to 'qwen2_vl' compatibility mode...")
+                 # 这里不需要改 config.json 文件，只是告诉 Transformers 怎么处理
+                 # 但如果库版本实在不支持，我们依赖 trust_remote_code 自动加载 modeling_qwen2_vl.py
+            
             self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
-                device_map={"": device}, # Accelerator safe map
+                device_map={"": device},
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2"
             )
         except Exception as e:
+            print(f"❌ Detailed VLM Load Error: {e}")
             raise RuntimeError(f"VLM Load Error: {e}")
+            
         self.tokenizer = self.processor.tokenizer
 
     def generate_description_batch(self, image_inputs, num_generations=4):
-        # Optimized prompt for Qwen-VL Instruct
         text_prompts = ["Describe this image in detail."] * len(image_inputs)
         
         inputs = self.processor(
