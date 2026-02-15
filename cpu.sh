@@ -7,11 +7,9 @@
 
 SAVE_DIR="./offline_packages"
 PYTHON_DIR="$SAVE_DIR/python_runtime"
-WHEEL_DIR="$SAVE_DIR/wheels"
+WEIGHTS_DIR="$SAVE_DIR/tool_weights"  # <--- 新增工具权重目录
 
-mkdir -p $PYTHON_DIR
-mkdir -p $WHEEL_DIR
-
+mkdir -p $PYTHON_DIR $WHEEL_DIR $DATA_DIR $WEIGHTS_DIR
 echo "🚀 [CPU Server] 开始构建全量离线包 (No-Deps Mode)..."
 
 # ------------------------------------------------------------------------
