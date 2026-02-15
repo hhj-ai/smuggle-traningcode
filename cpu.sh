@@ -131,11 +131,55 @@ download_wheel frozenlist
 download_wheel aiosignal
 download_wheel async-timeout
 
-# ------------------------------------------------------------------------
-# 6. 下载 Models.py 还原脚本 (方便 GPU 端使用)
-# ------------------------------------------------------------------------
-echo "🧹 [6/6] 生成还原脚本..."
-# (此处不下载，由 2_full_install.sh 生成)
+echo "🛠️  [7/7] 下载工具权重 (OCR & DINO)..."
+
+# 7.1 EasyOCR 权重
+# EasyOCR 运行时会去 ~/.EasyOCR/model/ 下找这两个文件
+echo "   ⬇️  EasyOCR Models..."
+OCR_DIR="$WEIGHTS_DIR/easyocr"
+mkdir -p $OCR_DIR
+
+# 下载检测模型 (CRAFT)
+wget -nc -O "$OCR_DIR/craft_mlt_25k.zip" "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/craft_mlt_25k.zip"
+unzip -o "$OCR_DIR/craft_mlt_25k.zip" -d "$OCR_DIR"
+rm "$OCR_DIR/craft_mlt_25k.zip"
+
+# 下载识别模型 (English)
+wget -nc -O "$OCR_DIR/english_g2.zip" "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip"
+unzip -o "$OCR_DIR/english_g2.zip" -d "$OCR_DIR"
+rm "$OCR_DIR/english_g2.zip"
+
+# 7.2 GroundingDINO 权重 (用于目标检测/验证)
+# 通常代码会加载 groundingdino_swint_ogc.pth
+echo "   ⬇️  GroundingDINO Weights..."
+DINO_DIR="$WEIGHTS_DIR/dino"
+mkdir -p $DINO_DIR
+
+# 下载权重
+wget -nc -P $DINO_DIR "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+
+# 下载配置文件 (有些库需要本地有 config 文件)
+wget -nc -P $DINO_DIR "https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+
+# 7.3 Sentence Transformers (如果你的评估代码用到了相似度计算)
+# 这是一个常见的隐形依赖
+echo "   ⬇️  Sentence Transformers (all-MiniLM-L6-v2)..."
+ST_DIR="$WEIGHTS_DIR/sentence-transformers"
+mkdir -p $ST_DIR
+# 使用 huggingface snapshot 下载 (借用之前的脚本逻辑)
+cat <<EOF > download_st.py
+from huggingface_hub import snapshot_download
+try:
+    snapshot_download(repo_id="sentence-transformers/all-MiniLM-L6-v2", local_dir="$ST_DIR/all-MiniLM-L6-v2")
+    print("   ✅ SentenceTransformer downloaded.")
+except: pass
+EOF
+python3 download_st.py
+rm download_st.py
 
 echo "------------------------------------------------"
-echo "✅ 终极下载完成！"
+echo "✅ 所有资源准备完毕！"
+echo "📂 检查权重目录: $WEIGHTS_DIR"
+echo "   ├── easyocr/ (craft_mlt_25k.pth, english_g2.pth)"
+echo "   ├── dino/ (groundingdino_swint_ogc.pth)"
+echo "   └── sentence-transformers/"
