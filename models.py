@@ -3,13 +3,37 @@ import re
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, AutoConfig
 
-# [CRITICAL PATCH] Register Qwen3-VL config if missing
-try:
-    from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration
-    AutoConfig.register("qwen3_vl", Qwen2VLConfig)
-    AutoModelForCausalLM.register(Qwen2VLConfig, Qwen2VLForConditionalGeneration)
-except ImportError:
-    pass # If Qwen2VL is also missing, we rely on trust_remote_code
+# ==============================================================================
+# 🔧 核心修改：动态注册 Qwen3 架构别名
+# ==============================================================================
+def register_custom_architectures():
+    """
+    在内存中将 'qwen3_vl' 注册为 'Qwen2VL' 的子类/别名。
+    这样无需修改 config.json 文件，transformers 也能正确识别架构。
+    """
+    try:
+        # 尝试导入 Qwen2VL 的配置和模型类（需要 transformers >= 4.45.0）
+        from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration
+        
+        print("🛠️  正在执行架构注册: Mapping 'qwen3_vl' -> Qwen2VL classes...")
+        
+        # 1. 注册配置类：告诉 AutoConfig 遇到 "qwen3_vl" 时使用 Qwen2VLConfig
+        AutoConfig.register("qwen3_vl", Qwen2VLConfig)
+        
+        # 2. 注册模型类：告诉 AutoModel 遇到这个配置时加载哪个模型类
+        AutoModelForCausalLM.register(Qwen2VLConfig, Qwen2VLForConditionalGeneration)
+        
+        print("✅  架构注册成功！现在可以直接加载 Qwen3-VL 了。")
+        
+    except ImportError:
+        print("\n⚠️  [严重警告] 你的 transformers 版本过低，无法导入 Qwen2VL 基类！")
+        print("   这会导致 Qwen3-VL 加载失败。请务必运行: pip install --upgrade transformers\n")
+    except Exception as e:
+        print(f"⚠️  架构注册过程中出现非致命错误: {e}")
+
+# 在模块导入时立即执行注册
+register_custom_architectures()
+# ==============================================================================
 
 class VerifierModel:
     """
@@ -19,14 +43,16 @@ class VerifierModel:
     def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
         self.device = device
         
+        # 路径检查
         if not os.path.exists(model_name):
-            print(f"⚠️ Warning: Local model path '{model_name}' not found. Attempting HF download/cache...")
+            print(f"⚠️ Warning: Local model path '{model_name}' not found. Fallback to HF ID.")
             if "models/" in model_name: 
                 model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
         
         print(f"Loading Verifier from: {model_name} ...")
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # DeepSeek R1 使用的是标准的 Llama/Qwen 结构，通常不需要特殊注册
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -93,24 +119,18 @@ class VLMModel:
         self.device = device
         
         if not os.path.exists(model_name):
-            print(f"⚠️ Warning: Local model path '{model_name}' not found. Attempting HF download/cache...")
+            print(f"⚠️ Warning: Local model path '{model_name}' not found. Fallback to HF ID.")
             if "models/" in model_name:
                 model_name = "Qwen/Qwen3-VL-8B-Instruct"
 
         print(f"Loading VLM from: {model_name} ...")
         
         try:
-            # [FIX] Manually load config to inspect/patch model_type if needed
-            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            
-            # 强制回退到 qwen2_vl 处理逻辑 (Qwen3-VL 通常兼容 Qwen2-VL 的代码)
-            if getattr(config, "model_type", "") == "qwen3_vl":
-                 print("⚠️ Detected 'qwen3_vl' model type. Patching to 'qwen2_vl' compatibility mode...")
-                 # 这里不需要改 config.json 文件，只是告诉 Transformers 怎么处理
-                 # 但如果库版本实在不支持，我们依赖 trust_remote_code 自动加载 modeling_qwen2_vl.py
-            
+            # 这里的 Processor 加载通常依赖 qwen2_vl 的处理逻辑
             self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             
+            # 由于我们在文件头部做了 register_custom_architectures()
+            # 这里 AutoModel 应该能自动识别 qwen3_vl 并调用 Qwen2VL 类
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
@@ -119,12 +139,13 @@ class VLMModel:
                 attn_implementation="flash_attention_2"
             )
         except Exception as e:
-            print(f"❌ Detailed VLM Load Error: {e}")
+            print(f"❌ VLM Load Error Details: {e}")
             raise RuntimeError(f"VLM Load Error: {e}")
             
         self.tokenizer = self.processor.tokenizer
 
     def generate_description_batch(self, image_inputs, num_generations=4):
+        # Qwen2/3-VL 的标准 Prompt 格式
         text_prompts = ["Describe this image in detail."] * len(image_inputs)
         
         inputs = self.processor(
