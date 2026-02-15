@@ -1,23 +1,31 @@
 import torch
 import re
+import os
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 
 class VerifierModel:
     """
-    Wrapper for Verifier (DeepSeek-R1-Distill-Qwen-7B).
+    Wrapper for Verifier.
+    Defaults to local path './models/DeepSeek-R1-Distill-Qwen-7B'.
     """
-    def __init__(self, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
+    def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
         self.device = device
-        print(f"Loading Verifier: {model_name}...")
+        
+        # Check if local path exists, otherwise warn or fallback
+        if not os.path.exists(model_name):
+            print(f"⚠️ Warning: Local model path '{model_name}' not found. Attempting HF download/cache...")
+            # Fallback to ID if local missing (optional, but good for safety)
+            if "models/" in model_name: 
+                model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        
+        print(f"Loading Verifier from: {model_name} ...")
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            # FIXED: Use dict for device_map to avoid accelerate conflicts
-            device_map={"": device},
+            device_map={"": device}, # Accelerator safe map
             trust_remote_code=True,
-            # H200 Optimization:
             attn_implementation="flash_attention_2"
         )
         if self.tokenizer.pad_token is None:
@@ -35,6 +43,7 @@ class VerifierModel:
         )
         
         raw_response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        # Remove <think> tags for claim extraction
         clean_text = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
         
         claims = []
@@ -72,20 +81,26 @@ class VerifierModel:
 
 class VLMModel:
     """
-    Wrapper for VLM (Qwen3-VL-8B-Instruct).
+    Wrapper for VLM.
+    Defaults to local path './models/Qwen3-VL-8B-Instruct'.
     """
-    def __init__(self, model_name="Qwen/Qwen3-VL-8B-Instruct", device="cuda"):
+    def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda"):
         self.device = device
-        print(f"Loading VLM: {model_name} with Flash Attention 2...")
+        
+        if not os.path.exists(model_name):
+            print(f"⚠️ Warning: Local model path '{model_name}' not found. Attempting HF download/cache...")
+            if "models/" in model_name:
+                model_name = "Qwen/Qwen3-VL-8B-Instruct"
+
+        print(f"Loading VLM from: {model_name} ...")
+        
         try:
             self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
-                # FIXED: Device map safe mode
-                device_map={"": device},
+                device_map={"": device}, # Accelerator safe map
                 trust_remote_code=True,
-                # H200 Optimization:
                 attn_implementation="flash_attention_2"
             )
         except Exception as e:
@@ -93,12 +108,8 @@ class VLMModel:
         self.tokenizer = self.processor.tokenizer
 
     def generate_description_batch(self, image_inputs, num_generations=4):
-        # Qwen-VL Instruct format requires proper structure
-        # Simplified here for generation
+        # Optimized prompt for Qwen-VL Instruct
         text_prompts = ["Describe this image in detail."] * len(image_inputs)
-        
-        # Note: Qwen processor usually handles 'text' and 'images' list directly
-        # But for batch generation, we let the processor handle the padding
         
         inputs = self.processor(
             text=text_prompts,
