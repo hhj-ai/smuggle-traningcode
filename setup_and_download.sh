@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # ==========================================
-# AURORA Project Data Setup Script
-# Environment: H200 Cluster Optimized
+# AURORA Project Data Setup Script (Enterprise Compatible)
+# Environment: Linux (Old wget compatible + HF Mirror)
 # ==========================================
 
-set -e  # Exit immediately if a command exits with a non-zero status.
+set -e  # 遇到错误立即停止
 
 echo "🚀 Starting AURORA Environment Setup & Data Download..."
 
-# 1. Create Directory Structure (Aligned with python scripts)
+# 1. 创建目录结构
 echo "📂 Creating directory structure..."
 mkdir -p ./data/yfcc100m
 mkdir -p ./data/benchmarks
@@ -18,28 +18,45 @@ mkdir -p ./output/checkpoints
 
 echo "✅ Directories ready: ./data, ./output"
 
-# 2. Download Benchmark Data (POPE & MMHal)
+# 2. 下载 Benchmark 数据 (兼容旧版 wget 和 curl)
 echo "📊 Downloading Benchmark Datasets..."
 
 POPE_URL="https://raw.githubusercontent.com/lavis-nlp/POPE/main/output/coco/coco_pope_random.json"
-MMHAL_URL="https://huggingface.co/datasets/SJTU-LIT/MMHal-Bench/resolve/main/mmhal_bench.json"
+# 使用 HF 镜像加速 MMHal 下载
+MMHAL_URL="https://hf-mirror.com/datasets/SJTU-LIT/MMHal-Bench/resolve/main/mmhal_bench.json"
 
-if [ ! -f "./data/benchmarks/pope_coco_random.json" ]; then
-    echo "   - Downloading POPE..."
-    wget -q --show-progress -O ./data/benchmarks/pope_coco_random.json "$POPE_URL" || echo "⚠️ Failed to download POPE, please check connection."
-else
-    echo "   - POPE already exists."
-fi
+download_file() {
+    url=$1
+    dest=$2
+    name=$3
+    
+    if [ ! -f "$dest" ]; then
+        echo "   - Downloading $name..."
+        # 尝试 wget (兼容旧版，无进度条)
+        if command -v wget >/dev/null 2>&1; then
+            wget -q -O "$dest" "$url"
+        # 回退到 curl
+        elif command -v curl >/dev/null 2>&1; then
+            curl -L -o "$dest" "$url" -s
+        else
+            echo "⚠️  Error: Neither wget nor curl found. Please download $url manually."
+            return 1
+        fi
+        
+        if [ $? -eq 0 ]; then
+            echo "     ✅ $name downloaded."
+        else
+            echo "     ❌ Failed to download $name. Check network/proxy."
+        fi
+    else
+        echo "   - $name already exists."
+    fi
+}
 
-if [ ! -f "./data/benchmarks/mmhal_bench.json" ]; then
-    echo "   - Downloading MMHal-Bench..."
-    wget -q --show-progress -O ./data/benchmarks/mmhal_bench.json "$MMHAL_URL" || echo "⚠️ Failed to download MMHal, please check connection."
-else
-    echo "   - MMHal already exists."
-fi
+download_file "$POPE_URL" "./data/benchmarks/pope_coco_random.json" "POPE"
+download_file "$MMHAL_URL" "./data/benchmarks/mmhal_bench.json" "MMHal-Bench"
 
-# 3. Download YFCC100M Images (High-Concurrency Python Script)
-# We embed a python script to handle the async downloading logic exactly as aurora_train.py does.
+# 3. 下载 YFCC100M 图片 (Python 脚本 + 镜像加速)
 echo "🖼️  Downloading YFCC100M Images (Target: 50,000)..."
 
 cat <<EOF > _downloader.py
@@ -48,17 +65,22 @@ import asyncio
 import aiohttp
 from io import BytesIO
 from PIL import Image
-from datasets import load_dataset
 from tqdm import tqdm
+
+# === 关键：注入国内镜像环境变量 ===
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+print(f"🌏 Enable HF Mirror: {os.environ['HF_ENDPOINT']}")
+
+from datasets import load_dataset
 
 # Configuration aligned with aurora_train.py
 ROOT_DIR = "./data/yfcc100m"
 TARGET_COUNT = 50000 
-CONCURRENCY = 200 # Optimized for H200 cluster bandwidth
+CONCURRENCY = 100 # 适当降低并发以避免内网防火墙限流
 
 async def download_image(session, url, idx):
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=15)
         async with session.get(url, timeout=timeout) as response:
             if response.status == 200:
                 content = await response.read()
@@ -81,11 +103,21 @@ async def main():
         print(f"✅ Found {len(existing)} images. Skipping download.")
         return
 
-    print(f"🌊 Streaming metadata from Hugging Face...")
+    print(f"🌊 Streaming metadata from Hugging Face Mirror...")
+    
+    # 尝试加载数据集，增加容错
     try:
+        # 首选源
         ds = load_dataset("limingcv/YFCC100M_OpenAI_subset", split="train", streaming=True, trust_remote_code=True)
-    except:
-        ds = load_dataset("dbrtag/yfcc100m", split="train", streaming=True, trust_remote_code=True)
+    except Exception as e:
+        print(f"⚠️  Primary source failed: {e}")
+        try:
+            # 备用源 (通常更稳定)
+            ds = load_dataset("dbrtag/yfcc100m", split="train", streaming=True, trust_remote_code=True)
+        except Exception as e2:
+            print(f"❌  All sources failed. 你的网络可能无法访问外部 HF 镜像。")
+            print(f"Error details: {e2}")
+            return
 
     print(f"⬇️  Downloading missing images (Target: {TARGET_COUNT})...")
     
@@ -98,12 +130,11 @@ async def main():
             if downloaded >= TARGET_COUNT:
                 break
             
-            # Skip if file already exists (simple check based on index assumption, 
-            # for robustness we just download forward)
             if os.path.exists(os.path.join(ROOT_DIR, f"yfcc_{i}.jpg")):
                 continue
 
-            url = item.get('url') or item.get('URL') or item.get('img_url')
+            # 兼容不同数据集的 URL 字段名
+            url = item.get('url') or item.get('URL') or item.get('img_url') or item.get('download_url')
             if not url: continue
             
             tasks.append(asyncio.create_task(download_image(session, url, i)))
@@ -123,7 +154,12 @@ async def main():
         pbar.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"\n❌ Python script execution failed: {e}")
+        print("建议手动检查: ping hf-mirror.com 是否通畅")
+
 EOF
 
 # Run the embedded python downloader
