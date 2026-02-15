@@ -21,18 +21,19 @@ from rewards import RewardCalculator
 YFCC_ROOT_DIR = "./data/yfcc100m"
 CHECKPOINT_DIR = "./output/checkpoints"
 
-# H200 Optimization:
-# 141GB VRAM allows massive batches.
-BATCH_SIZE = 32      # Per GPU Batch (Total = 32 * 8 = 256 images/step)
-GROUP_SIZE = 8       # Increased samples per image for better RL variance reduction
+# ✅ MODEL PATHS (Point to Local)
+LOCAL_VLM_PATH = "./models/Qwen3-VL-8B-Instruct"
+LOCAL_VERIFIER_PATH = "./models/DeepSeek-R1-Distill-Qwen-7B"
+
+# H200 Optimization
+BATCH_SIZE = 32      # Per GPU Batch (Total = 256)
+GROUP_SIZE = 8       # Samples per image
 EPOCHS = 5
 LEARNING_RATE_VLM = 1e-6
 LEARNING_RATE_VERIFIER = 1e-6
 
-# ✅ DATASET AUTO-DOWNLOAD CONFIG
-# H200 runs fast, so we need a decent amount of data.
-# The script will automatically download this many images if the folder is empty.
-DOWNLOAD_COUNT = 50000
+# Auto-Download Config
+DOWNLOAD_COUNT = 50000 
 # -----------------------------
 
 os.makedirs(YFCC_ROOT_DIR, exist_ok=True)
@@ -49,13 +50,10 @@ class YFCCDownloader:
             async with session.get(url, timeout=timeout) as response:
                 if response.status == 200:
                     content = await response.read()
-                    # Verify image validity
                     try:
                         Image.open(BytesIO(content)).verify()
                     except:
                         return False
-                    
-                    # Save image
                     path = os.path.join(self.root_dir, f"yfcc_{idx}.jpg")
                     with open(path, "wb") as f:
                         f.write(content)
@@ -65,17 +63,15 @@ class YFCCDownloader:
         return False
 
     async def run(self):
-        print(f"🌍 [Auto-Data] Streaming YFCC100M metadata from Hugging Face...")
+        print(f"🌍 [Auto-Data] Streaming YFCC100M metadata...")
         try:
-            # Using a reliable YFCC100M subset from HF
-            ds = load_dataset("limingcv/YFCC100M_OpenAI_subset", split="train", streaming=True, trust_remote_code=True)
+            # Using dalle-mini subset as it's more stable
+            ds = load_dataset("dalle-mini/YFCC100M_OpenAI_subset", split="train", streaming=True)
         except Exception as e:
-            print(f"⚠️  Primary dataset source failed: {e}")
-            print("🔄 Switching to backup source 'dbrtag/yfcc100m'...")
-            ds = load_dataset("dbrtag/yfcc100m", split="train", streaming=True, trust_remote_code=True)
+            print(f"⚠️  Dataset load failed: {e}")
+            return
 
-        print(f"⬇️  [Auto-Data] Downloading {self.target_count} images to {self.root_dir}...")
-        print(f"    This may take a few minutes depending on your cluster's bandwidth.")
+        print(f"⬇️  Downloading {self.target_count} images to {self.root_dir}...")
         
         async with aiohttp.ClientSession() as session:
             tasks = []
@@ -86,16 +82,18 @@ class YFCCDownloader:
                 if downloaded >= self.target_count:
                     break
                 
-                # Try different URL keys common in YFCC datasets
-                url = item.get('url') or item.get('URL') or item.get('img_url') or item.get('download_url')
+                url = item.get('url') or item.get('URL') or item.get('img_url')
                 if not url:
+                    # Some datasets have bytes directly
+                    if 'img' in item and item['img']:
+                        # Handle bytes if needed, but for now stick to URL logic or skip
+                        continue
                     continue
                 
                 task = asyncio.create_task(self.download_image(session, url, i))
                 tasks.append(task)
                 
-                # High concurrency for H200 cluster bandwidth
-                if len(tasks) >= 200:
+                if len(tasks) >= 200: 
                     results = await asyncio.gather(*tasks)
                     success_count = sum(results)
                     downloaded += success_count
@@ -107,12 +105,8 @@ class YFCCDownloader:
                 downloaded += sum(results)
                 pbar.update(sum(results))
             pbar.close()
-            print(f"✅ [Auto-Data] Download complete! {downloaded} images saved to {self.root_dir}.")
 
 def ensure_yfcc_data(root_dir):
-    """
-    Checks if data exists. If not, triggers the downloader.
-    """
     try:
         files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
         count = len(files)
@@ -120,23 +114,20 @@ def ensure_yfcc_data(root_dir):
         count = 0
     
     if count < 100:
-        print(f"⚠️  Data directory {root_dir} is empty or low on data ({count} images).")
-        print("🚀 Initiating Automatic Download Procedure...")
+        print(f"⚠️  Data directory {root_dir} is empty or low ({count} images).")
+        print("🚀 Initiating Download...")
         downloader = YFCCDownloader(root_dir)
         asyncio.run(downloader.run())
     else:
-        print(f"✅ Found {count} existing images in {root_dir}. Skipping download.")
+        print(f"✅ Found {count} existing images.")
 
 class YFCCDataset(Dataset):
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.image_files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        
-        # Fallback if download failed completely (should not happen with downloader)
-        if not self.image_files:
-            print("❌ Critical Error: No images found even after download attempt.")
+        if not self.image_files: 
             self.use_mock = True
-        else:
+        else: 
             self.use_mock = False
 
     def __len__(self):
@@ -149,7 +140,6 @@ class YFCCDataset(Dataset):
             image = Image.open(img_path).convert("RGB")
             return image, img_path
         except Exception:
-            # Robust skip if an image is corrupted
             return self.__getitem__((idx + 1) % len(self))
 
 def collate_fn(batch):
@@ -184,23 +174,27 @@ def calculate_intra_claim_correlation(claims, model):
     return avg_corr.item()
 
 def train():
-    # H200: Enable TF32 for faster training
     torch.backends.cuda.matmul.allow_tf32 = True
-    
     accelerator = Accelerator(gradient_accumulation_steps=1)
     device = accelerator.device
     
     if accelerator.is_main_process:
         print(f"🚀 AURORA: Adversarial VLM Training Started on {torch.cuda.get_device_name(0)}")
-        print(f"   Config: Batch={BATCH_SIZE}, Group={GROUP_SIZE}")
-        # ✅ TRIGGER AUTO-DOWNLOAD ON MAIN PROCESS
+        print(f"   Mode: Local Model Loading")
+        print(f"   VLM Path: {LOCAL_VLM_PATH}")
+        print(f"   Verifier Path: {LOCAL_VERIFIER_PATH}")
         ensure_yfcc_data(YFCC_ROOT_DIR)
     
     accelerator.wait_for_everyone()
 
-    # 1. Initialize Models
-    vlm = VLMModel(device=device)
-    verifier = VerifierModel(device=device)
+    # 1. Initialize Models with Local Paths
+    # IMPORTANT: Check if paths exist to avoid obscure errors
+    if not os.path.exists(LOCAL_VLM_PATH):
+        raise FileNotFoundError(f"❌ Local VLM model not found at {LOCAL_VLM_PATH}. Please run setup_sg.sh")
+    
+    vlm = VLMModel(model_name=LOCAL_VLM_PATH, device=device)
+    verifier = VerifierModel(model_name=LOCAL_VERIFIER_PATH, device=device)
+    
     tools = ToolVerifier(device=device)
     reward_calc = RewardCalculator()
     similarity_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
@@ -231,14 +225,13 @@ def train():
                     vlm_generated_texts.append(diverse_descs)
             
             flat_descriptions = [d for group in vlm_generated_texts for d in group]
-            # ✅ FIXED: Correctly expand images to match flat descriptions
             flat_images = [img for img in images for _ in range(GROUP_SIZE)]
             flat_img_paths = [path for path in image_paths for _ in range(GROUP_SIZE)]
             
-            # Step B: Verifier Generation
+            # Step B: Verifier
             verifier_claims_map = []
-            verifier_raw_responses = []
-            verifier_correlation_scores = []
+            verifier_raw_responses = [] 
+            verifier_correlation_scores = [] 
             
             with torch.no_grad():
                 for desc in flat_descriptions:
@@ -248,7 +241,7 @@ def train():
                     corr_score = calculate_intra_claim_correlation(claims, similarity_model)
                     verifier_correlation_scores.append(corr_score)
 
-            # Step C: Tool Execution
+            # Step C: Tools
             verification_results = []
             for i, claims in enumerate(verifier_claims_map):
                 img_path = flat_img_paths[i]
@@ -259,7 +252,7 @@ def train():
                     res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})
                 verification_results.append(res_per_desc)
 
-            # === PHASE 2: Train VLM (FIXED: WITH IMAGES) ===
+            # === PHASE 2: Train VLM ===
             vlm_optimizer.zero_grad()
             all_vlm_rewards = []
             
@@ -288,7 +281,7 @@ def train():
                     group_rewards.append(r_vlm)
                 all_vlm_rewards.extend(group_rewards)
 
-            # GRPO VLM Update
+            # Update VLM
             vlm_rewards_tensor = torch.tensor(all_vlm_rewards, device=device).view(-1, GROUP_SIZE)
             vlm_mean = vlm_rewards_tensor.mean(dim=1, keepdim=True)
             vlm_std = vlm_rewards_tensor.std(dim=1, keepdim=True) + 1e-8
@@ -296,10 +289,7 @@ def train():
             vlm_advantages = vlm_advantages.view(-1)
             
             total_vlm_loss = 0
-            
-            # ✅ FIXED LOOP: Pass both text AND images to VLM for training
             for k, (text, img) in enumerate(zip(flat_descriptions, flat_images)):
-                # Construct Qwen-VL prompt
                 messages = [
                     {"role": "user", "content": [
                         {"type": "image", "image": img},
@@ -308,14 +298,7 @@ def train():
                     {"role": "assistant", "content": [{"type": "text", "text": text}]}
                 ]
                 text_input = vlm.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                
-                inputs = vlm.processor(
-                    text=[text_input],
-                    images=[img],
-                    padding=True,
-                    return_tensors="pt"
-                ).to(device)
-                
+                inputs = vlm.processor(text=[text_input], images=[img], padding=True, return_tensors="pt").to(device)
                 log_prob = vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
                 loss = -vlm_advantages[k] * log_prob
                 total_vlm_loss += loss
@@ -337,7 +320,7 @@ def train():
                 count = len(res_list) if len(res_list) > 0 else 1
                 all_verifier_rewards.append(v_reward_sum / count)
 
-            # GRPO Verifier Update
+            # Update Verifier
             verifier_rewards_tensor = torch.tensor(all_verifier_rewards, device=device).view(-1, GROUP_SIZE)
             v_mean = verifier_rewards_tensor.mean(dim=1, keepdim=True)
             v_std = verifier_rewards_tensor.std(dim=1, keepdim=True) + 1e-8
