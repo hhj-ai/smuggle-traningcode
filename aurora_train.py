@@ -99,18 +99,19 @@ def train():
         print(f"   Data: {yfcc_root} | MiniLM: {args.minilm_path}")
 
     # 3. Load Models (Force Local + Sequential to prevent RAM OOM)
-    # 强制 8 个进程排队加载，避免 240G RAM 瞬间爆掉
+    import time
+    vlm = None
+    verifier = None
+    
     for i in range(accelerator.num_processes):
         if accelerator.local_process_index == i:
-            print(f"📦 [Rank {i}] Loading models...")
+            print(f"📦 [Rank {i}] Loading models into GPU (RAM protection mode)...")
             vlm = VLMModel(model_name=vlm_path, device=device)
             verifier = VerifierModel(model_name=verifier_path, device=device)
+            print(f"✅ [Rank {i}] Load complete.")
+            time.sleep(2)
+        # 必须在 if 外面同步，确保所有 rank 都按序排队
         accelerator.wait_for_everyone()
-    
-    # Optional Compile
-    if hasattr(torch, 'compile'):
-        vlm.model = torch.compile(vlm.model)
-        verifier.model = torch.compile(verifier.model)
     
     # 4. Initialize Tools & Rewards
     tools = ToolVerifier(device=device, model_root=args.model_dir)
