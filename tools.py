@@ -1,4 +1,5 @@
 import torch
+import os
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 from transformers import CLIPProcessor, CLIPModel
