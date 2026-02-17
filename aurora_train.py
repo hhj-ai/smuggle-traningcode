@@ -259,16 +259,13 @@ def train():
         for batch_idx, (images, image_paths) in enumerate(progress_bar):
             
             # === PHASE 1: Generate Data ===
-            oversample_factor = 2 if not args.no_diversity else 1
             vlm_generated_texts = []
             
             with torch.no_grad():
                 for img in images:
-                    raw_descs = vlm.generate_description_batch([img], num_generations=GROUP_SIZE * oversample_factor)[0]
-                    if not args.no_diversity:
-                        diverse_descs = select_diverse_descriptions(raw_descs, similarity_model, GROUP_SIZE)
-                    else:
-                        diverse_descs = raw_descs[:GROUP_SIZE]
+                    # 采样两倍，通过多样性算法选出最优的 GROUP_SIZE 个描述
+                    raw_descs = vlm.generate_description_batch([img], num_generations=GROUP_SIZE * 2)[0]
+                    diverse_descs = select_diverse_descriptions(raw_descs, similarity_model, GROUP_SIZE)
                     vlm_generated_texts.append(diverse_descs)
             
             flat_descriptions = [d for group in vlm_generated_texts for d in group]
@@ -389,8 +386,9 @@ def train():
                 verifier_optimizer.step()
             
             if accelerator.is_main_process and batch_idx % 5 == 0:
-                postfix = {"VLM_R": f"{vlm_rewards_tensor.mean().item():.2f}"}
-                if args.mode == "AURORA":
+                vlm_r_avg = vlm_rewards_tensor.mean().item()
+                postfix = {"VLM_R": f"{vlm_r_avg:.2f}"}
+                if args.mode == "AURORA" and 'verifier_rewards_tensor' in locals():
                     postfix["Ver_R"] = f"{verifier_rewards_tensor.mean().item():.2f}"
                 progress_bar.set_postfix(postfix)
                 
