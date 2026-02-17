@@ -75,4 +75,4 @@ setsid accelerate launch \
     --output_dir "$OUTPUT_DIR" \
     --batch_size 16 > "$LOG_NAME" 2>&1 < /dev/null &
 
-echo "🚀 已后台启动。日志: tail -f $LOG_NAME"
+echo "🚀 已后台启动。日志: tail -n +1 -f $LOG_NAME"
