@@ -10,31 +10,36 @@ class ToolVerifier:
     def __init__(self, device="cuda", model_root="./models"):
         self.device = device
         self.model_root = model_root
-        print(f"🔧 Initializing Verification Tools (Offline Mode: {model_root})...")
         
-        # 1. Grounding DINO
-        dino_path = os.path.join(model_root, "grounding-dino-base")
-        if not os.path.exists(dino_path): dino_path = "IDEA-Research/grounding-dino-base"
+        # 路径验证：确保离线路径真实存在，否则报错而非尝试联网
+        dino_path = os.path.abspath(os.path.join(model_root, "grounding-dino-base"))
+        clip_path = os.path.abspath(os.path.join(model_root, "clip-vit-base-patch32"))
         
-        try:
-            self.dino_processor = AutoProcessor.from_pretrained(dino_path)
-            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path).to(device)
-        except Exception as e:
-            print(f"Error DINO: {e}")
+        print(f"🔧 [Tools] Loading from local path: {model_root}")
+        assert os.path.exists(dino_path), f"❌ DINO path missing: {dino_path}"
+        assert os.path.exists(clip_path), f"❌ CLIP path missing: {clip_path}"
 
-        # 2. EasyOCR
-        # EasyOCR needs models in ~/.EasyOCR/model, we will handle this in run script
-        self.ocr_reader = easyocr.Reader(['en'], gpu=(device == "cuda"))
-        
-        # 3. CLIP
-        clip_path = os.path.join(model_root, "clip-vit-base-patch32")
-        if not os.path.exists(clip_path): clip_path = "openai/clip-vit-base-patch32"
-        
+        # 1. Grounding DINO (Force Offline + GPU)
         try:
-            self.clip_model = CLIPModel.from_pretrained(clip_path).to(device)
-            self.clip_processor = CLIPProcessor.from_pretrained(clip_path)
+            self.dino_processor = AutoProcessor.from_pretrained(dino_path, local_files_only=True)
+            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path, local_files_only=True).to(device)
+            self.dino_model.eval()
+            print("   - DINO loaded ✅")
         except Exception as e:
-            print(f"Error CLIP: {e}")
+            print(f"❌ Error DINO: {e}")
+
+        # 2. EasyOCR (GPU)
+        self.ocr_reader = easyocr.Reader(['en'], gpu=(device != "cpu"))
+        print("   - OCR loaded ✅")
+        
+        # 3. CLIP (Force Offline + GPU)
+        try:
+            self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(device)
+            self.clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
+            self.clip_model.eval()
+            print("   - CLIP loaded ✅")
+        except Exception as e:
+            print(f"❌ Error CLIP: {e}")
         
         print("✅ Tools Ready.")
 
