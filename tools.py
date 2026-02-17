@@ -28,9 +28,18 @@ class ToolVerifier:
         except Exception as e:
             print(f"❌ Error DINO: {e}")
 
-        # 2. EasyOCR (GPU)
-        self.ocr_reader = easyocr.Reader(['en'], gpu=(device != "cpu"))
-        print("   - OCR loaded ✅")
+        # 2. EasyOCR (GPU 绑定)
+        use_gpu = False
+        if isinstance(device, torch.device):
+            use_gpu = (device.type == 'cuda')
+        elif isinstance(device, str):
+            use_gpu = ('cuda' in device)
+            
+        try:
+            self.ocr_reader = easyocr.Reader(['en'], gpu=use_gpu)
+            print(f"   - OCR loaded (GPU: {use_gpu}) ✅")
+        except Exception as e:
+            print(f"❌ Error OCR: {e}")
         
         # 3. CLIP (Force Offline + GPU)
         try:

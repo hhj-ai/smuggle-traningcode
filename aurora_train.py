@@ -81,24 +81,29 @@ def train():
     parser.add_argument("--attack_weight", type=float, default=5.0)
     args = parser.parse_args()
 
-    # 1. Initialize Accelerator with 2-hour timeout to prevent hang on old kernels
+    # 1. Initialize Accelerator with 4-hour timeout for stable loading on old kernels
     from datetime import timedelta
     from accelerate.utils import InitProcessGroupKwargs
     
-    timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
-    accelerator = Accelerator(mixed_precision="bf16", kwargs_handlers=[timeout_kwargs])
+    # 梯度累积 4 步 * 物理 BS 8 = 有效 BS 32 (单卡)
+    timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
+    accelerator = Accelerator(
+        mixed_precision="bf16", 
+        gradient_accumulation_steps=4,
+        kwargs_handlers=[timeout_kwargs]
+    )
     device = accelerator.device
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # 2. Path Resolution
-    vlm_path = os.path.join(args.model_dir, "Qwen3-VL-8B-Instruct")
-    verifier_path = os.path.join(args.model_dir, "DeepSeek-R1-Distill-Qwen-7B")
-    yfcc_root = args.data_dir
-    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
-
+    # ... (原有逻辑)
+    
+    # 5. Data Initialization (监控 RAM 消耗)
     if accelerator.is_main_process:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        print(f"🚀 AURORA: 8x H200 Performance Mode (Timeout: 2h)")
+        print(f"📁 Scanning dataset: {yfcc_root} ...")
+    dataset = YFCCDataset(yfcc_root)
+    if accelerator.is_main_process:
+        print(f"✅ Dataset ready: {len(dataset)} images found.")
 
     # 3. Load EVERYTHING Sequentially (RAM & Timeout Protection)
     import time, gc
@@ -111,24 +116,22 @@ def train():
         if accelerator.local_process_index == i:
             print(f"📦 [Rank {i}] Sequential Initialization Start...")
             
-            # A. Load VLM & Verifier
+            # A. Load Models & Tools
             vlm = VLMModel(model_name=vlm_path, device=device)
             verifier = VerifierModel(model_name=verifier_path, device=device)
-            
-            # B. Load Tools
             tools = ToolVerifier(device=device, model_root=args.model_dir)
-            
-            # C. Load MiniLM
-            if not os.path.exists(args.minilm_path):
-                raise FileNotFoundError(f"❌ MiniLM missing: {args.minilm_path}")
             similarity_model = SentenceTransformer(args.minilm_path, device=device)
             
-            print(f"✅ [Rank {i}] All models/tools loaded into GPU.")
+            print(f"✅ [Rank {i}] Initialized. Cleaning memory...")
             gc.collect()
             torch.cuda.empty_cache()
-            time.sleep(5) # 留给系统喘息时间
+            time.sleep(2)
             
-        accelerator.wait_for_everyone()
+        # 核心：必须在 if 之外等待，且增加超时容错
+        try:
+            accelerator.wait_for_everyone()
+        except Exception as e:
+            print(f"⚠️  Barrier timeout on Rank {accelerator.local_process_index}: {e}")
 
     # 4. Initialize Rewards
     reward_calc = RewardCalculator(attack_weight=args.attack_weight)

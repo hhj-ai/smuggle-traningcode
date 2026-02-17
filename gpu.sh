@@ -18,9 +18,13 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # 核心：限制多进程 CPU 抢占，防止 RAM 崩溃
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-# 增加 NCCL 稳定性配置
-export NCCL_TIMEOUT=7200
-export NCCL_IB_DISABLE=0 # 如果集群支持 RDMA，请保持 0
+
+# 稳定性增强：针对旧内核 (4.18) 的 NCCL 优化
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=0
+export NCCL_SOCKET_IFNAME=eth0,enp,bond # 根据你的网卡名自动匹配
+export NCCL_TIMEOUT=14400  # 4 小时
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # 激活环境
 source "$PROD_ENV/bin/activate"
@@ -39,7 +43,7 @@ setsid accelerate launch \
     --data_dir "$DATA_DIR" \
     --minilm_path "$MODELS_DIR/minilm" \
     --output_dir "$OUTPUT_DIR" \
-    --batch_size 32 \
+    --batch_size 8 \
     --attack_weight 5.0 > "$LOG_NAME" 2>&1 < /dev/null &
 
 echo "🚀 已启动稳定性模式！日志: tail -f $LOG_NAME"

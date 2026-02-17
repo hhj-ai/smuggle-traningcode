@@ -130,6 +130,12 @@ class VLMModel:
             
         self.model.eval()
         self.tokenizer = self.processor.tokenizer
+        
+        # [AURORA Core] 全参数训练：必须保持 Vision Tower 可训练
+        # 仅开启 Gradient Checkpointing 以节省显存
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            print("🚀 Enabling Gradient Checkpointing (Full Parameter Training)...")
+            self.model.gradient_checkpointing_enable()
 
     def generate_description_batch(self, image_inputs, num_generations=4):
         messages_batch = []
