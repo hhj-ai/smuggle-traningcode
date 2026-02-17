@@ -1,67 +1,53 @@
 #!/bin/bash
-# ==============================================================================
-# AURORA Offline Downloader (v5.0 - Final)
-# ------------------------------------------------------------------------------
-# 策略：全量下载 + 源码包清洗 + 完整依赖覆盖
-# ==============================================================================
+# --- 1. 绝对路径定义 ---
+CODE_DIR=$(pwd)
+# 将所有大资源放在 Git 仓库之外
+RES_DIR=$(realpath "$CODE_DIR/../aurora_resources")
+MODELS_DIR="$RES_DIR/models"
+DATA_DIR="$RES_DIR/data"
+ENV_DIR="$RES_DIR/env"
 
-SAVE_DIR="./offline_packages"
-WHEEL_DIR="$SAVE_DIR/wheels"
-PYTHON_DIR="$SAVE_DIR/python_runtime"
-mkdir -p $WHEEL_DIR $PYTHON_DIR
+echo "🌐 [CPU] 正在准备离线资源..."
+echo "📍 存储根目录: $RES_DIR"
 
-echo "🚀 [Builder] 开始全量资源采集..."
+mkdir -p "$MODELS_DIR" "$DATA_DIR"
 
-# --- 1. Python Runtime ---
-wget -nc -q -O "$PYTHON_DIR/python-3.10.tar.gz" "https://github.com/indygreg/python-build-standalone/releases/download/20240224/cpython-3.10.13+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz"
+# 2. 本地 Miniconda 环境安装
+if [ ! -d "$RES_DIR/miniconda" ]; then
+    echo "📦 安装本地 Conda..."
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O mini.sh
+    bash mini.sh -b -p "$RES_DIR/miniconda" && rm mini.sh
+fi
+source "$RES_DIR/miniconda/bin/activate"
 
-# --- 2. PyTorch (Binary) ---
-BASE_URL="https://download.pytorch.org/whl/cu121"
-for pkg in "torch-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl" \
-           "torchvision-0.19.1%2Bcu121-cp310-cp310-linux_x86_64.whl" \
-           "torchaudio-2.4.1%2Bcu121-cp310-cp310-linux_x86_64.whl"; do
-    wget -nc -q -P $WHEEL_DIR "$BASE_URL/$pkg"
-done
+# 3. 创建环境
+if [ ! -d "$ENV_DIR" ]; then
+    conda create -p "$ENV_DIR" python=3.10 -y
+    conda activate "$ENV_DIR"
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    pip install transformers==4.46.3 accelerate datasets easyocr sentence-transformers aiohttp tqdm pillow
+fi
 
-# --- 3. Flash Attention (Pre-built Wheel) ---
-# 强制清理源码包，防止 GPU 误编译
-rm -f "$WHEEL_DIR/flash_attn"*.tar.gz
-FLASH_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu121torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
-wget -nc -q -P $WHEEL_DIR "$FLASH_URL"
-
-# --- 4. Transformers (Source) ---
-wget -nc -q -O "$WHEEL_DIR/transformers-main.zip" "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
-
-# --- 5. 依赖全家桶 ---
-echo "📚 下载依赖 (含 Scikit-Learn)..."
-download_dep() {
-    pip download "$@" --dest $WHEEL_DIR --index-url https://pypi.org/simple \
-        --python-version 3.10 --platform manylinux2014_x86_64 \
-        --only-binary=:all: --no-deps --quiet
+# 4. 模型精准下载
+python <<EOF
+import os
+from huggingface_hub import snapshot_download
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+tasks = {
+    "Qwen/Qwen3-VL-8B-Instruct": "$MODELS_DIR/Qwen3-VL-8B-Instruct",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-7B",
+    "IDEA-Research/grounding-dino-base": "$MODELS_DIR/grounding-dino-base",
+    "openai/clip-vit-base-patch32": "$MODELS_DIR/clip-vit-base-patch32",
+    "sentence-transformers/all-MiniLM-L6-v2": "$MODELS_DIR/minilm"
 }
+for repo, path in tasks.items():
+    if not os.path.exists(path):
+        print(f"Downloading {repo}...")
+        snapshot_download(repo_id=repo, local_dir=path, local_dir_use_symlinks=False, ignore_patterns=["*.msgpack", "*.h5", "*.ot"])
+EOF
 
-# 基础工具
-download_dep numpy==1.26.4 packaging ninja psutil setuptools wheel einops
-# 科学计算 (修复 sentence-transformers 依赖)
-download_dep scikit-learn==1.3.2 joblib threadpoolctl scipy pandas
-# 网络库
-download_dep httpx httpcore anyio sniffio h11 hf-xet exceptiongroup
-download_dep aiohttp aiohappyeyeballs yarl multidict frozenlist aiosignal attrs
-download_dep requests urllib3 idna certifi charset-normalizer
-# 框架工具
-download_dep accelerate huggingface-hub tokenizers safetensors pyyaml tqdm
-download_dep rich pygments markdown-it-py mdurl shellingham click typer typer-slim colorama
-download_dep filelock fsspec typing-extensions
-# 图像与业务
-download_dep datasets pillow timm sentence-transformers
-download_dep easyocr scikit-image python-bidi protobuf sentencepiece
-download_dep dill multiprocess pyarrow regex sympy networkx jinja2 MarkupSafe mpmath
-# NVIDIA Runtime
-download_dep nvidia-cuda-runtime-cu12==12.1.105 nvidia-cublas-cu12==12.1.3.1 \
-             nvidia-cudnn-cu12==9.1.0.70 nvidia-nvjitlink-cu12==12.1.105 \
-             nvidia-curand-cu12==10.3.2.106 nvidia-cusolver-cu12==11.4.5.107 \
-             nvidia-nccl-cu12==2.20.5 triton==3.0.0 nvidia-nvtx-cu12==12.1.105 \
-             nvidia-cuda-nvrtc-cu12==12.1.105 nvidia-cuda-cupti-cu12==12.1.105 \
-             nvidia-cufft-cu12==11.0.2.54 nvidia-cusparse-cu12==12.1.0.106
+# 5. 准备 EasyOCR
+python -c "import easyocr; easyocr.Reader(['en'])"
+cp -r ~/.EasyOCR "$RES_DIR/easyocr_cache"
 
-echo "✅ 采集完成！Scikit-Learn 与 Flash-Attn Wheel 已就绪。"
+echo "✅ [CPU] 准备就绪。资源已安全存储在 $RES_DIR"
