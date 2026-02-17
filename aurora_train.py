@@ -123,6 +123,8 @@ def train():
     # 5. 完整训练循环
     if accelerator.is_main_process:
         print(f"[INFO] Starting training loop, total batches: {len(dataloader)}", flush=True)
+    accelerator.wait_for_everyone()
+    print(f"[DEBUG-Rank{accelerator.local_process_index}] All ranks synchronized, starting epoch loop", flush=True)
     for epoch in range(5):
         pbar = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}")
         for batch_idx, (images, image_paths) in enumerate(pbar):
@@ -131,15 +133,20 @@ def train():
             flat_desc = []
             flat_images = []
             flat_paths = []
-            
+
             with torch.no_grad():
-                for img, path in zip(images, image_paths):
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] Starting VLM generation for {len(images)} images", flush=True)
+                for idx, (img, path) in enumerate(zip(images, image_paths)):
+                    print(f"[DEBUG-Rank{accelerator.local_process_index}] Generating descriptions for image {idx+1}/{len(images)}", flush=True)
                     # 采样 10 个选 8 个
                     raw = vlm.generate_description_batch([img], num_generations=10)[0]
+                    print(f"[DEBUG-Rank{accelerator.local_process_index}] Generated {len(raw)} raw descriptions", flush=True)
                     diverse = select_diverse_descriptions(raw, similarity_model, GROUP_SIZE)
+                    print(f"[DEBUG-Rank{accelerator.local_process_index}] Selected {len(diverse)} diverse descriptions", flush=True)
                     flat_desc.extend(diverse)
                     flat_images.extend([img] * len(diverse))
                     flat_paths.extend([path] * len(diverse))
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] VLM generation complete, total descriptions: {len(flat_desc)}", flush=True)
             
             # === PHASE 2: Verifier 提取与验证 ===
             ver_results = []
