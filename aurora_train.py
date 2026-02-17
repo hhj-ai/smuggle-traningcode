@@ -173,35 +173,79 @@ def calculate_intra_claim_correlation(claims, model):
     avg_corr = cos_sim.sum() / (len(claims) * (len(claims) - 1))
     return avg_corr.item()
 
+import argparse
+
 def train():
+    parser = argparse.ArgumentParser(description="AURORA Training")
+    parser.add_argument("--mode", type=str, default="AURORA")
+    parser.add_argument("--model_dir", type=str, default="../aurora_resources/models")
+    parser.add_argument("--data_dir", type=str, default="../aurora_resources/data")
+    parser.add_argument("--output_dir", type=str, default="../aurora_resources/output")
+    parser.add_argument("--minilm_path", type=str, default="../aurora_resources/models/minilm")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--attack_weight", type=float, default=5.0)
+    args = parser.parse_args()
+
+    # 路径解析：支持绝对路径或相对于 model_dir 的子目录
+    def get_path(base, sub):
+        p = os.path.join(base, sub)
+        return p if os.path.exists(p) else sub
+
+    vlm_path = get_path(args.model_dir, "Qwen3-VL-8B-Instruct")
+    verifier_path = get_path(args.model_dir, "DeepSeek-R1-Distill-Qwen-7B")
+    yfcc_root = os.path.join(args.data_dir, "yfcc100m")
+
+    # 动态创建输出目录
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    
     torch.backends.cuda.matmul.allow_tf32 = True
-    accelerator = Accelerator(gradient_accumulation_steps=1)
+    accelerator = Accelerator(mixed_precision="bf16")
     device = accelerator.device
     
     if accelerator.is_main_process:
-        print(f"🚀 AURORA: Adversarial VLM Training Started on {torch.cuda.get_device_name(0)}")
-        print(f"   Mode: Local Model Loading")
-        print(f"   VLM Path: {LOCAL_VLM_PATH}")
-        print(f"   Verifier Path: {LOCAL_VERIFIER_PATH}")
-        ensure_yfcc_data(YFCC_ROOT_DIR)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"🚀 AURORA: 8x H200 High-Performance Mode")
+        print(f"   VLM: {vlm_path} | Verifier: {verifier_path}")
+        print(f"   Output: {checkpoint_dir}")
     
-    accelerator.wait_for_everyone()
+    # 初始化模型
+    vlm = VLMModel(model_name=vlm_path, device=device)
+    verifier = VerifierModel(model_name=verifier_path, device=device)
+    # H200 极致加速
+    if hasattr(torch, 'compile'):
+        vlm.model = torch.compile(vlm.model)
+        verifier.model = torch.compile(verifier.model)
+    
+    tools = ToolVerifier(device=device, model_root=args.model_dir)
+    reward_calc = RewardCalculator(attack_weight=args.attack_weight)
+    similarity_model = SentenceTransformer(args.minilm_path, device=device)
 
-    # 1. Initialize Models with Local Paths
-    # IMPORTANT: Check if paths exist to avoid obscure errors
-    if not os.path.exists(LOCAL_VLM_PATH):
-        raise FileNotFoundError(f"❌ Local VLM model not found at {LOCAL_VLM_PATH}. Please run setup_sg.sh")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # 显式设置混合精度为 bf16
+    accelerator = Accelerator(mixed_precision="bf16")
+    device = accelerator.device
     
-    vlm = VLMModel(model_name=LOCAL_VLM_PATH, device=device)
-    verifier = VerifierModel(model_name=LOCAL_VERIFIER_PATH, device=device)
+    if accelerator.is_main_process:
+        print(f"🚀 AURORA: 8x H200 Performance Mode [BF16 Enabled]")
+        if not os.path.exists(yfcc_root): os.makedirs(yfcc_root, exist_ok=True)
     
-    tools = ToolVerifier(device=device)
-    reward_calc = RewardCalculator()
+    # 初始化模型
+    vlm = VLMModel(model_name=vlm_path, device=device)
+    verifier = VerifierModel(model_name=verifier_path, device=device)
+
+    # --- H200 极致加速: 启用 PyTorch 2.x 编译优化 ---
+    if hasattr(torch, 'compile'):
+        if accelerator.is_main_process: print("⚡ Enabling torch.compile for H200 kernels...")
+        vlm.model = torch.compile(vlm.model)
+        verifier.model = torch.compile(verifier.model)
+    
+    tools = ToolVerifier(device=device, model_root=args.model_dir)
+    reward_calc = RewardCalculator(attack_weight=args.attack_weight)
     similarity_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
     # 2. Data & Optimizers
     dataset = YFCCDataset(YFCC_ROOT_DIR)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
     
     vlm_optimizer = torch.optim.AdamW(vlm.model.parameters(), lr=LEARNING_RATE_VLM)
     verifier_optimizer = torch.optim.AdamW(verifier.model.parameters(), lr=LEARNING_RATE_VERIFIER)
@@ -215,128 +259,140 @@ def train():
         for batch_idx, (images, image_paths) in enumerate(progress_bar):
             
             # === PHASE 1: Generate Data ===
-            oversample_factor = 2
+            oversample_factor = 2 if not args.no_diversity else 1
             vlm_generated_texts = []
             
             with torch.no_grad():
                 for img in images:
                     raw_descs = vlm.generate_description_batch([img], num_generations=GROUP_SIZE * oversample_factor)[0]
-                    diverse_descs = select_diverse_descriptions(raw_descs, similarity_model, GROUP_SIZE)
+                    if not args.no_diversity:
+                        diverse_descs = select_diverse_descriptions(raw_descs, similarity_model, GROUP_SIZE)
+                    else:
+                        diverse_descs = raw_descs[:GROUP_SIZE]
                     vlm_generated_texts.append(diverse_descs)
             
             flat_descriptions = [d for group in vlm_generated_texts for d in group]
             flat_images = [img for img in images for _ in range(GROUP_SIZE)]
             flat_img_paths = [path for path in image_paths for _ in range(GROUP_SIZE)]
             
-            # Step B: Verifier
-            verifier_claims_map = []
-            verifier_raw_responses = [] 
-            verifier_correlation_scores = [] 
-            
-            with torch.no_grad():
-                for desc in flat_descriptions:
-                    claims, raw_resp = verifier.verify_claims(desc)
-                    verifier_claims_map.append(claims)
-                    verifier_raw_responses.append(raw_resp)
-                    corr_score = calculate_intra_claim_correlation(claims, similarity_model)
-                    verifier_correlation_scores.append(corr_score)
-
-            # Step C: Tools
+            # === PHASE 2: Verification (Skipped in CLIP_ONLY baseline) ===
             verification_results = []
-            for i, claims in enumerate(verifier_claims_map):
-                img_path = flat_img_paths[i]
-                res_per_desc = []
-                for claim in claims:
-                    verdict, conf, reason = tools.verify_claim(claim, img_path)
-                    traceable = claim.lower() in flat_descriptions[i].lower()
-                    res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})
-                verification_results.append(res_per_desc)
+            verifier_raw_responses = [] 
+            verifier_correlation_scores = []
 
-            # === PHASE 2: Train VLM ===
+            if args.mode == "AURORA":
+                # Step B: Verifier logic
+                verifier_claims_map = []
+                with torch.no_grad():
+                    for desc in flat_descriptions:
+                        claims, raw_resp = verifier.verify_claims(desc)
+                        verifier_claims_map.append(claims)
+                        verifier_raw_responses.append(raw_resp)
+                        corr_score = calculate_intra_claim_correlation(claims, similarity_model)
+                        verifier_correlation_scores.append(corr_score)
+
+                # Step C: Tools logic
+                for i, claims in enumerate(verifier_claims_map):
+                    img_path = flat_img_paths[i]
+                    res_per_desc = []
+                    for claim in claims:
+                                            # Robust Traceability Check (Token Overlap)
+                                            def is_traceable(claim_text, source_text, threshold=0.7):
+                                                claim_tokens = set(claim_text.lower().split())
+                                                source_tokens = set(source_text.lower().split())
+                                                if not claim_tokens: return True
+                                                overlap = claim_tokens.intersection(source_tokens)
+                                                return (len(overlap) / len(claim_tokens)) >= threshold
+                        
+                                            verdict, conf, reason = tools.verify_claim(claim, img_path)
+                                            traceable = is_traceable(claim, flat_descriptions[i])
+                                            res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})                    verification_results.append(res_per_desc)
+            
+            # === PHASE 3: Train VLM ===
             vlm_optimizer.zero_grad()
             all_vlm_rewards = []
             
             for i in range(len(images)):
                 start_idx = i * GROUP_SIZE
                 end_idx = start_idx + GROUP_SIZE
-                group_results = verification_results[start_idx:end_idx]
                 group_texts = flat_descriptions[start_idx:end_idx]
                 
-                # Diversity Penalty
-                if GROUP_SIZE > 1:
+                # Diversity Penalty (Only for AURORA)
+                diversity_penalty = 0.0
+                if args.mode == "AURORA" and GROUP_SIZE > 1:
                     embeddings = similarity_model.encode(group_texts, convert_to_tensor=True)
                     cos_sim = util.pytorch_cos_sim(embeddings, embeddings)
                     mask = torch.triu(torch.ones_like(cos_sim), diagonal=1).bool()
                     avg_sim = cos_sim[mask].mean().item() if mask.any() else 0.0
                     diversity_penalty = avg_sim * 2.0
-                else:
-                    diversity_penalty = 0.0
                 
                 group_rewards = []
-                for j, res in enumerate(group_results):
-                    correct = sum(1 for r in res if r['verdict'] == 'correct')
-                    incorrect = sum(1 for r in res if r['verdict'] == 'incorrect')
-                    r_vlm = reward_calc.calculate_vlm_reward(correct, incorrect, len(res), len(group_texts[j].split()))
-                    r_vlm -= diversity_penalty
-                    group_rewards.append(r_vlm)
+                if args.mode == "AURORA":
+                    group_results = verification_results[start_idx:end_idx]
+                    for j, res in enumerate(group_results):
+                        correct = sum(1 for r in res if r['verdict'] == 'correct')
+                        incorrect = sum(1 for r in res if r['verdict'] == 'incorrect')
+                        r_vlm = reward_calc.calculate_vlm_reward(correct, incorrect, len(res), len(group_texts[j].split()))
+                        r_vlm -= diversity_penalty
+                        group_rewards.append(r_vlm)
+                else: # CLIP_ONLY Baseline
+                    for j, text in enumerate(group_texts):
+                        img = images[i]
+                        clip_score = tools._verify_clip(text[:100], img) # Text truncated for CLIP
+                        group_rewards.append(clip_score * 5.0) # Scale to match AURORA range
+
                 all_vlm_rewards.extend(group_rewards)
 
-            # Update VLM
+            # Update VLM Logic
             vlm_rewards_tensor = torch.tensor(all_vlm_rewards, device=device).view(-1, GROUP_SIZE)
             vlm_mean = vlm_rewards_tensor.mean(dim=1, keepdim=True)
             vlm_std = vlm_rewards_tensor.std(dim=1, keepdim=True) + 1e-8
             vlm_advantages = (vlm_rewards_tensor - vlm_mean) / vlm_std
             vlm_advantages = vlm_advantages.view(-1)
             
+            # VLM Gradient Step (simplified call)
             total_vlm_loss = 0
             for k, (text, img) in enumerate(zip(flat_descriptions, flat_images)):
-                messages = [
-                    {"role": "user", "content": [
-                        {"type": "image", "image": img},
-                        {"type": "text", "text": "Describe this image in detail."}
-                    ]},
-                    {"role": "assistant", "content": [{"type": "text", "text": text}]}
-                ]
+                messages = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe this image in detail."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
                 text_input = vlm.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 inputs = vlm.processor(text=[text_input], images=[img], padding=True, return_tensors="pt").to(device)
                 log_prob = vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
-                loss = -vlm_advantages[k] * log_prob
-                total_vlm_loss += loss
+                total_vlm_loss += -vlm_advantages[k] * log_prob
             
             total_vlm_loss = total_vlm_loss / len(flat_descriptions)
             accelerator.backward(total_vlm_loss)
             vlm_optimizer.step()
 
-            # === PHASE 3: Train Verifier ===
-            verifier_optimizer.zero_grad()
-            all_verifier_rewards = []
-            
-            for k, res_list in enumerate(verification_results):
-                v_reward_sum = 0.0
-                corr_penalty = verifier_correlation_scores[k]
-                for r in res_list:
-                    r_val = reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], correlation_score=corr_penalty)
-                    v_reward_sum += r_val
-                count = len(res_list) if len(res_list) > 0 else 1
-                all_verifier_rewards.append(v_reward_sum / count)
+            # === PHASE 4: Train Verifier (Only in AURORA mode) ===
+            if args.mode == "AURORA":
+                verifier_optimizer.zero_grad()
+                all_verifier_rewards = []
+                for k, res_list in enumerate(verification_results):
+                    v_reward_sum = 0.0
+                    corr_penalty = verifier_correlation_scores[k]
+                    for r in res_list:
+                        r_val = reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], correlation_score=corr_penalty)
+                        v_reward_sum += r_val
+                    all_verifier_rewards.append(v_reward_sum / (len(res_list) if res_list else 1))
 
-            # Update Verifier
-            verifier_rewards_tensor = torch.tensor(all_verifier_rewards, device=device).view(-1, GROUP_SIZE)
-            v_mean = verifier_rewards_tensor.mean(dim=1, keepdim=True)
-            v_std = verifier_rewards_tensor.std(dim=1, keepdim=True) + 1e-8
-            v_advantages = (verifier_rewards_tensor - v_mean) / v_std
-            v_advantages = v_advantages.view(-1)
+                verifier_rewards_tensor = torch.tensor(all_verifier_rewards, device=device).view(-1, GROUP_SIZE)
+                v_adv = (verifier_rewards_tensor - verifier_rewards_tensor.mean()) / (verifier_rewards_tensor.std() + 1e-8)
+                v_adv = v_adv.view(-1)
+                
+                total_verifier_loss = 0
+                for k, raw_text in enumerate(verifier_raw_responses):
+                    log_prob = verifier.compute_sequence_log_prob(prompt=flat_descriptions[k], completion=raw_text)
+                    total_verifier_loss += -v_adv[k] * log_prob
+                
+                total_verifier_loss = total_verifier_loss / len(flat_descriptions)
+                accelerator.backward(total_verifier_loss)
+                verifier_optimizer.step()
             
-            total_verifier_loss = 0
-            for k, raw_text in enumerate(verifier_raw_responses):
-                description_context = flat_descriptions[k]
-                log_prob = verifier.compute_sequence_log_prob(prompt=description_context, completion=raw_text)
-                loss = -v_advantages[k] * log_prob
-                total_verifier_loss += loss
-            
-            total_verifier_loss = total_verifier_loss / len(flat_descriptions)
-            accelerator.backward(total_verifier_loss)
-            verifier_optimizer.step()
+            if accelerator.is_main_process and batch_idx % 5 == 0:
+                progress_bar.set_postfix({
+                    "VLM_R": f"{vlm_rewards_tensor.mean().item():.2f}",
+                    "Ver_R": f"{verifier_rewards_tensor.mean().item():.2f}" if args.mode=="AURORA" else "N/A"
+                })
             
             if accelerator.is_main_process and batch_idx % 5 == 0:
                 progress_bar.set_postfix({

@@ -6,27 +6,32 @@ import easyocr
 import numpy as np
 
 class ToolVerifier:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", model_root="./models"):
         self.device = device
-        print("🔧 Initializing Verification Tools...")
+        self.model_root = model_root
+        print(f"🔧 Initializing Verification Tools (Offline Mode: {model_root})...")
         
         # 1. Grounding DINO
-        print("   - Loading Grounding DINO...")
+        dino_path = os.path.join(model_root, "grounding-dino-base")
+        if not os.path.exists(dino_path): dino_path = "IDEA-Research/grounding-dino-base"
+        
         try:
-            self.dino_processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
-            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").to(device)
+            self.dino_processor = AutoProcessor.from_pretrained(dino_path)
+            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path).to(device)
         except Exception as e:
             print(f"Error DINO: {e}")
 
         # 2. EasyOCR
-        print("   - Loading EasyOCR...")
+        # EasyOCR needs models in ~/.EasyOCR/model, we will handle this in run script
         self.ocr_reader = easyocr.Reader(['en'], gpu=(device == "cuda"))
         
         # 3. CLIP
-        print("   - Loading CLIP...")
+        clip_path = os.path.join(model_root, "clip-vit-base-patch32")
+        if not os.path.exists(clip_path): clip_path = "openai/clip-vit-base-patch32"
+        
         try:
-            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            self.clip_model = CLIPModel.from_pretrained(clip_path).to(device)
+            self.clip_processor = CLIPProcessor.from_pretrained(clip_path)
         except Exception as e:
             print(f"Error CLIP: {e}")
         
