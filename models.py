@@ -57,12 +57,20 @@ class VLMModel:
         self.device = device
         print(f"Loading VLM: {model_name} on {device}")
         
-        # 加载 Processor
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-        # 核心修改：强制使用通用 AutoModelForCausalLM 以获得最稳健的 low_cpu_mem_usage 支持
-        # 避开 Qwen3VLClass 可能存在的初始化 CPU RAM 尖峰
-        self.model = AutoModelForCausalLM.from_pretrained(
+        # 核心修正：多模态模型必须用专用类或 AutoModelForVision2Seq
+        # AutoModelForCausalLM 不支持 Qwen3VLConfig
+        from transformers import AutoModel
+        try:
+            # 尝试导入官方推荐的类
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+            ModelClass = Qwen3VLForConditionalGeneration
+        except ImportError:
+            # 回退方案：让 AutoModel 自己去猜（通常会映射到 Vision2Seq）
+            ModelClass = AutoModel
+
+        self.model = ModelClass.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
