@@ -46,7 +46,8 @@ class VerifierModel:
             torch_dtype=torch.bfloat16, 
             device_map={"": device}, 
             trust_remote_code=True, 
-            attn_implementation="flash_attention_2"
+            attn_implementation="sdpa",
+            local_files_only=True
         )
         self.model.eval()
 
@@ -109,7 +110,8 @@ class VLMModel:
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2"
+                attn_implementation="sdpa",
+            local_files_only=True
             )
         else:
             # 最后的兜底
@@ -119,7 +121,8 @@ class VLMModel:
                 torch_dtype=torch.bfloat16,
                 device_map={"": device},
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2"
+                attn_implementation="sdpa",
+            local_files_only=True
             )
             
         self.model.eval()
