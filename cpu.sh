@@ -4,15 +4,11 @@ CODE_DIR=$(cd "$(dirname "$0")"; pwd)
 RES_DIR=$(realpath "$CODE_DIR/../aurora_resources")
 MODELS_DIR="$RES_DIR/models"
 
-echo "🌐 [CPU] 正在准备离线资源..."
-echo "📍 存储根目录: $RES_DIR"
-
-# 创建目录
+echo "🌐 [CPU] 开始资产补全..."
 mkdir -p "$MODELS_DIR"
-
-# 强制使用国内镜像
 export HF_ENDPOINT="https://hf-mirror.com"
 
+# 1. 强制补全脚本
 python <<EOF
 import os
 from huggingface_hub import snapshot_download
@@ -26,22 +22,29 @@ tasks = {
 }
 
 for repo, folder in tasks.items():
-    target_path = os.path.join("$MODELS_DIR", folder)
-    print(f"Checking {folder}...")
-    if not os.path.exists(target_path) or not os.listdir(target_path):
-        print(f"⬇️  Downloading: {repo}")
+    target = os.path.join("$MODELS_DIR", folder)
+    print(f"🔍 Checking: {folder}")
+    
+    # 如果目录不存在或为空，强制下载
+    if not os.path.exists(target) or not os.listdir(target):
+        print(f"⬇️  Downloading {repo}...")
         try:
             snapshot_download(
-                repo_id=repo, 
-                local_dir=target_path, 
-                local_dir_use_symlinks=False,
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.tf"]
+                repo_id=repo,
+                local_dir=target,
+                local_dir_use_symlinks=False, # 关键：不用软链接
+                resume_download=True
             )
+            print(f"✅ {folder} Downloaded.")
         except Exception as e:
-            print(f"❌ Failed: {e}")
+            print(f"❌ Error downloading {folder}: {e}")
     else:
-        print(f"✔️  Exists.")
+        print(f"✔️  {folder} Exists.")
 EOF
 
-echo "✅ 资产补全完成。目录内容："
+# 2. 最终确认
+echo "--------------------------------"
+echo "📂 当前模型目录结构:"
 ls -F "$MODELS_DIR"
+echo "--------------------------------"
+echo "请确认以上列表包含 grounding-dino-base/ 和 clip-vit-base-patch32/"
