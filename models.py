@@ -47,7 +47,8 @@ class VerifierModel:
             device_map={"": device}, 
             trust_remote_code=True, 
             attn_implementation="sdpa",
-            local_files_only=True
+            local_files_only=True,
+            low_cpu_mem_usage=True
         )
         self.model.eval()
 
@@ -111,7 +112,8 @@ class VLMModel:
                 device_map={"": device},
                 trust_remote_code=True,
                 attn_implementation="sdpa",
-            local_files_only=True
+            local_files_only=True,
+            low_cpu_mem_usage=True
             )
         else:
             # 最后的兜底
@@ -122,7 +124,8 @@ class VLMModel:
                 device_map={"": device},
                 trust_remote_code=True,
                 attn_implementation="sdpa",
-            local_files_only=True
+            local_files_only=True,
+            low_cpu_mem_usage=True
             )
             
         self.model.eval()

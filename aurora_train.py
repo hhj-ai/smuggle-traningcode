@@ -98,9 +98,14 @@ def train():
         print(f"   VLM: {vlm_path} | Verifier: {verifier_path}")
         print(f"   Data: {yfcc_root} | MiniLM: {args.minilm_path}")
 
-    # 3. Load Models (Force Local)
-    vlm = VLMModel(model_name=vlm_path, device=device)
-    verifier = VerifierModel(model_name=verifier_path, device=device)
+    # 3. Load Models (Force Local + Sequential to prevent RAM OOM)
+    # 强制 8 个进程排队加载，避免 240G RAM 瞬间爆掉
+    for i in range(accelerator.num_processes):
+        if accelerator.local_process_index == i:
+            print(f"📦 [Rank {i}] Loading models...")
+            vlm = VLMModel(model_name=vlm_path, device=device)
+            verifier = VerifierModel(model_name=verifier_path, device=device)
+        accelerator.wait_for_everyone()
     
     # Optional Compile
     if hasattr(torch, 'compile'):
