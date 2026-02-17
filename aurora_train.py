@@ -105,20 +105,48 @@ def train():
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"🚀 AURORA: 8x H200 Performance Mode (Timeout: 4h)")
 
-    # 3. Load Models & Tools in Parallel (H200 High-Speed Mode)
+    # 3. Adaptive Loading (Parallel if RAM > 300G, else Sequential)
+    import time, gc
+    
+    def get_total_ram_gb():
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        # 示例: MemTotal: 263842816 kB
+                        return int(line.split()[1]) / (1024 * 1024)
+        except: return 128 # 默认保守值
+        return 128
+
+    total_ram_gb = get_total_ram_gb()
+    # 8 卡加载约需 240G，阈值设为 300G
+    use_sequential = total_ram_gb < 300
+    
     if accelerator.is_main_process:
-        print(f"📦 Parallel Initialization Start on all 8 GPUs...")
-    
-    vlm = VLMModel(model_name=vlm_path, device=device)
-    verifier = VerifierModel(model_name=verifier_path, device=device)
-    tools = ToolVerifier(device=device, model_root=args.model_dir)
-    
-    if not os.path.exists(args.minilm_path):
-        raise FileNotFoundError(f"❌ MiniLM missing: {args.minilm_path}")
-    similarity_model = SentenceTransformer(args.minilm_path, device=device)
-    
+        mode_str = "SEQUENTIAL (RAM Protection)" if use_sequential else "PARALLEL (High Speed)"
+        print(f"🧠 System RAM: {total_ram_gb:.1f}GB | Loading Mode: {mode_str}")
+
+    vlm, verifier, tools, similarity_model = None, None, None, None
+
+    if not use_sequential:
+        vlm = VLMModel(model_name=vlm_path, device=device)
+        verifier = VerifierModel(model_name=verifier_path, device=device)
+        tools = ToolVerifier(device=device, model_root=args.model_dir)
+        similarity_model = SentenceTransformer(args.minilm_path, device=device)
+    else:
+        for i in range(accelerator.num_processes):
+            if accelerator.local_process_index == i:
+                print(f"📦 [Rank {i}] Loading models (Sequential)...")
+                vlm = VLMModel(model_name=vlm_path, device=device)
+                verifier = VerifierModel(model_name=verifier_path, device=device)
+                tools = ToolVerifier(device=device, model_root=args.model_dir)
+                similarity_model = SentenceTransformer(args.minilm_path, device=device)
+                gc.collect(); torch.cuda.empty_cache()
+                time.sleep(2)
+            accelerator.wait_for_everyone()
+
     if accelerator.is_main_process:
-        print(f"✅ All models/tools loaded. Starting training...")
+        print(f"✅ All models/tools loaded. Total RAM used: {psutil.virtual_memory().used / (1024**3):.1f}GB")
 
     # 4. Initialize Rewards
     reward_calc = RewardCalculator(attack_weight=args.attack_weight)
