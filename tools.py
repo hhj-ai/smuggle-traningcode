@@ -59,10 +59,17 @@ class ToolVerifier:
 
         # 降级逻辑：如果 DINO 没加载成功，只跑 CLIP
         if self.dino_model is None:
-            return self._verify_clip(claim, image)
-            
-        # ... (原有验证逻辑保持不变) ...
-        return self._verify_dino(claim, image) # 简化展示
+            score = self._verify_clip(claim, image)
+        else:
+            score = self._verify_dino(claim, image)
+
+        # 根据置信度分数判断 verdict
+        if score <= 0.0:  # 工具失败或无法判断
+            return "uncertain", score, "tool failed"
+        elif score > 0.5:
+            return "correct", score, ""
+        else:
+            return "incorrect", score, ""
 
     def _verify_dino(self, claim, image):
         if not self.dino_model: return 0.0

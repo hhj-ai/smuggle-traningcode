@@ -82,25 +82,36 @@ def train():
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"🚀 AURORA: 8x H200 (14GB RAM Mode)")
 
-    # 3. 顺序加载
+    # 3. 并行加载（避免死锁）
     vlm, verifier, tools, similarity_model = None, None, None, None
     try:
-        for i in range(accelerator.num_processes):
-            if accelerator.local_process_index == i:
-                print(f"📦 [Rank {i}] Loading...")
-                vlm = VLMModel(model_name=vlm_path, device=device)
-                verifier = VerifierModel(model_name=verifier_path, device=device)
-                tools = ToolVerifier(device=device, model_root=args.model_dir)
-                similarity_model = SentenceTransformer(args.minilm_path, device=device)
-                gc.collect(); torch.cuda.empty_cache()
-            accelerator.wait_for_everyone()
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading models in parallel...", flush=True)
+        vlm = VLMModel(model_name=vlm_path, device=device)
+        print(f"  ✓ VLM loaded", flush=True)
+        verifier = VerifierModel(model_name=verifier_path, device=device)
+        print(f"  ✓ Verifier loaded", flush=True)
+        tools = ToolVerifier(device=device, model_root=args.model_dir)
+        print(f"  ✓ Tools loaded", flush=True)
+        similarity_model = SentenceTransformer(args.minilm_path, device=device)
+        print(f"  ✓ SentenceTransformer loaded", flush=True)
+        gc.collect(); torch.cuda.empty_cache()
+        print(f"  ✓ Memory cleaned", flush=True)
     except Exception as e:
-        print(f"🛑 INIT FAILED: {e}")
+        print(f"🛑 INIT FAILED: {e}", flush=True)
         sys.exit(1)
+
+    accelerator.wait_for_everyone()
+    print(f"[DEBUG] Rank {accelerator.local_process_index} all models loaded and synchronized", flush=True)
 
     reward_calc = RewardCalculator(attack_weight=args.attack_weight)
     dataset = YFCCDataset(args.data_dir, max_samples=20000)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=2, pin_memory=True)
+    print(f"[DEBUG] Dataset size: {len(dataset)} images", flush=True)
+    if len(dataset) == 0:
+        print(f"🛑 ERROR: No images found in {args.data_dir}", flush=True)
+        sys.exit(1)
+    # 使用num_workers=0避免分布式环境下的问题
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0, pin_memory=False)
+    print(f"[DEBUG] Dataloader created, batch size: {args.batch_size}", flush=True)
     
     v_opt = torch.optim.AdamW(vlm.model.parameters(), lr=1e-6)
     ver_opt = torch.optim.AdamW(verifier.model.parameters(), lr=1e-6)
@@ -110,6 +121,8 @@ def train():
     GROUP_SIZE = 8
 
     # 5. 完整训练循环
+    if accelerator.is_main_process:
+        print(f"[INFO] Starting training loop, total batches: {len(dataloader)}", flush=True)
     for epoch in range(5):
         pbar = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}")
         for batch_idx, (images, image_paths) in enumerate(pbar):
