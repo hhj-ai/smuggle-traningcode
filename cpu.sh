@@ -1,20 +1,22 @@
 #!/bin/bash
-# --- 路径定义 (务必与共享盘一致) ---
-CODE_DIR=$(pwd)
-RES_DIR=$(realpath "$CODE_ROOT/../aurora_resources")
-MODELS_DIR="$RES_ROOT/models"
+# --- 统一路径定义 ---
+CODE_DIR=$(cd "$(dirname "$0")"; pwd)
+RES_DIR=$(realpath "$CODE_DIR/../aurora_resources")
+MODELS_DIR="$RES_DIR/models"
 
-echo "🌐 [CPU] 开始精准补全缺失模型资产..."
+echo "🌐 [CPU] 正在准备离线资源..."
+echo "📍 存储根目录: $RES_DIR"
+
+# 创建目录
 mkdir -p "$MODELS_DIR"
 
-# 强制使用国内镜像源
+# 强制使用国内镜像
 export HF_ENDPOINT="https://hf-mirror.com"
 
 python <<EOF
 import os
 from huggingface_hub import snapshot_download
 
-# 定义 AURORA 运行必须的 5 大组件
 tasks = {
     "IDEA-Research/grounding-dino-base": "grounding-dino-base",
     "openai/clip-vit-base-patch32": "clip-vit-base-patch32",
@@ -25,21 +27,21 @@ tasks = {
 
 for repo, folder in tasks.items():
     target_path = os.path.join("$MODELS_DIR", folder)
+    print(f"Checking {folder}...")
     if not os.path.exists(target_path) or not os.listdir(target_path):
-        print(f"⬇️  正在下载: {repo} -> {target_path}")
+        print(f"⬇️  Downloading: {repo}")
         try:
             snapshot_download(
                 repo_id=repo, 
                 local_dir=target_path, 
                 local_dir_use_symlinks=False,
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.tf"] # 只下 PT 权重，省空间
+                ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.tf"]
             )
-            print(f"✅ {folder} 下载完成")
         except Exception as e:
-            print(f"❌ {folder} 下载失败: {e}")
+            print(f"❌ Failed: {e}")
     else:
-        print(f"✔️  {folder} 已存在，跳过。")
+        print(f"✔️  Exists.")
 EOF
 
-echo "🎉 [CPU] 所有资产已就绪。请确认 $MODELS_DIR 目录下文件夹完整。"
+echo "✅ 资产补全完成。目录内容："
 ls -F "$MODELS_DIR"
