@@ -292,21 +292,21 @@ def train():
                         verifier_correlation_scores.append(corr_score)
 
                 # Step C: Tools logic
+                def is_traceable(claim_text, source_text, threshold=0.7):
+                    claim_tokens = set(claim_text.lower().split())
+                    source_tokens = set(source_text.lower().split())
+                    if not claim_tokens: return True
+                    overlap = claim_tokens.intersection(source_tokens)
+                    return (len(overlap) / len(claim_tokens)) >= threshold
+
                 for i, claims in enumerate(verifier_claims_map):
                     img_path = flat_img_paths[i]
                     res_per_desc = []
                     for claim in claims:
-                                            # Robust Traceability Check (Token Overlap)
-                                            def is_traceable(claim_text, source_text, threshold=0.7):
-                                                claim_tokens = set(claim_text.lower().split())
-                                                source_tokens = set(source_text.lower().split())
-                                                if not claim_tokens: return True
-                                                overlap = claim_tokens.intersection(source_tokens)
-                                                return (len(overlap) / len(claim_tokens)) >= threshold
-                        
-                                            verdict, conf, reason = tools.verify_claim(claim, img_path)
-                                            traceable = is_traceable(claim, flat_descriptions[i])
-                                            res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})                    verification_results.append(res_per_desc)
+                        verdict, conf, reason = tools.verify_claim(claim, img_path)
+                        traceable = is_traceable(claim, flat_descriptions[i])
+                        res_per_desc.append({'claim': claim, 'verdict': verdict, 'traceable': traceable})
+                    verification_results.append(res_per_desc)
             
             # === PHASE 3: Train VLM ===
             vlm_optimizer.zero_grad()
@@ -389,16 +389,10 @@ def train():
                 verifier_optimizer.step()
             
             if accelerator.is_main_process and batch_idx % 5 == 0:
-                progress_bar.set_postfix({
-                    "VLM_R": f"{vlm_rewards_tensor.mean().item():.2f}",
-                    "Ver_R": f"{verifier_rewards_tensor.mean().item():.2f}" if args.mode=="AURORA" else "N/A"
-                })
-            
-            if accelerator.is_main_process and batch_idx % 5 == 0:
-                progress_bar.set_postfix({
-                    "VLM_R": f"{vlm_rewards_tensor.mean().item():.2f}",
-                    "Ver_R": f"{verifier_rewards_tensor.mean().item():.2f}"
-                })
+                postfix = {"VLM_R": f"{vlm_rewards_tensor.mean().item():.2f}"}
+                if args.mode == "AURORA":
+                    postfix["Ver_R"] = f"{verifier_rewards_tensor.mean().item():.2f}"
+                progress_bar.set_postfix(postfix)
                 
         if accelerator.is_main_process:
             save_path = os.path.join(CHECKPOINT_DIR, f"aurora_epoch_{epoch}")
