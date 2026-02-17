@@ -1,53 +1,45 @@
 #!/bin/bash
-# --- 1. 绝对路径定义 ---
+# --- 路径定义 (务必与共享盘一致) ---
 CODE_DIR=$(pwd)
-# 将所有大资源放在 Git 仓库之外
-RES_DIR=$(realpath "$CODE_DIR/../aurora_resources")
-MODELS_DIR="$RES_DIR/models"
-DATA_DIR="$RES_DIR/data"
-ENV_DIR="$RES_DIR/env"
+RES_DIR=$(realpath "$CODE_ROOT/../aurora_resources")
+MODELS_DIR="$RES_ROOT/models"
 
-echo "🌐 [CPU] 正在准备离线资源..."
-echo "📍 存储根目录: $RES_DIR"
+echo "🌐 [CPU] 开始精准补全缺失模型资产..."
+mkdir -p "$MODELS_DIR"
 
-mkdir -p "$MODELS_DIR" "$DATA_DIR"
+# 强制使用国内镜像源
+export HF_ENDPOINT="https://hf-mirror.com"
 
-# 2. 本地 Miniconda 环境安装
-if [ ! -d "$RES_DIR/miniconda" ]; then
-    echo "📦 安装本地 Conda..."
-    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O mini.sh
-    bash mini.sh -b -p "$RES_DIR/miniconda" && rm mini.sh
-fi
-source "$RES_DIR/miniconda/bin/activate"
-
-# 3. 创建环境
-if [ ! -d "$ENV_DIR" ]; then
-    conda create -p "$ENV_DIR" python=3.10 -y
-    conda activate "$ENV_DIR"
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    pip install transformers==4.46.3 accelerate datasets easyocr sentence-transformers aiohttp tqdm pillow
-fi
-
-# 4. 模型精准下载
 python <<EOF
 import os
 from huggingface_hub import snapshot_download
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+# 定义 AURORA 运行必须的 5 大组件
 tasks = {
-    "Qwen/Qwen3-VL-8B-Instruct": "$MODELS_DIR/Qwen3-VL-8B-Instruct",
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-7B",
-    "IDEA-Research/grounding-dino-base": "$MODELS_DIR/grounding-dino-base",
-    "openai/clip-vit-base-patch32": "$MODELS_DIR/clip-vit-base-patch32",
-    "sentence-transformers/all-MiniLM-L6-v2": "$MODELS_DIR/minilm"
+    "IDEA-Research/grounding-dino-base": "grounding-dino-base",
+    "openai/clip-vit-base-patch32": "clip-vit-base-patch32",
+    "Qwen/Qwen3-VL-8B-Instruct": "Qwen3-VL-8B-Instruct",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": "DeepSeek-R1-Distill-Qwen-7B",
+    "sentence-transformers/all-MiniLM-L6-v2": "minilm"
 }
-for repo, path in tasks.items():
-    if not os.path.exists(path):
-        print(f"Downloading {repo}...")
-        snapshot_download(repo_id=repo, local_dir=path, local_dir_use_symlinks=False, ignore_patterns=["*.msgpack", "*.h5", "*.ot"])
+
+for repo, folder in tasks.items():
+    target_path = os.path.join("$MODELS_DIR", folder)
+    if not os.path.exists(target_path) or not os.listdir(target_path):
+        print(f"⬇️  正在下载: {repo} -> {target_path}")
+        try:
+            snapshot_download(
+                repo_id=repo, 
+                local_dir=target_path, 
+                local_dir_use_symlinks=False,
+                ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.tf"] # 只下 PT 权重，省空间
+            )
+            print(f"✅ {folder} 下载完成")
+        except Exception as e:
+            print(f"❌ {folder} 下载失败: {e}")
+    else:
+        print(f"✔️  {folder} 已存在，跳过。")
 EOF
 
-# 5. 准备 EasyOCR
-python -c "import easyocr; easyocr.Reader(['en'])"
-cp -r ~/.EasyOCR "$RES_DIR/easyocr_cache"
-
-echo "✅ [CPU] 准备就绪。资源已安全存储在 $RES_DIR"
+echo "🎉 [CPU] 所有资产已就绪。请确认 $MODELS_DIR 目录下文件夹完整。"
+ls -F "$MODELS_DIR"
