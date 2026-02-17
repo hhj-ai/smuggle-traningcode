@@ -170,14 +170,14 @@ def train():
                     ver_results.append(res_per_desc)
 
             # === PHASE 3: VLM 训练 ===
-            v_opt.zero_grad()
+            print(f"[DEBUG-Rank{accelerator.local_process_index}] Calculating VLM rewards for {len(flat_desc)} descriptions", flush=True)
             all_vlm_rewards = []
-            
-            for i in range(len(images)): # 按组处理
+
+            for i in range(len(images)): # 按组处理奖励计算
                 start, end = i * GROUP_SIZE, (i + 1) * GROUP_SIZE
                 group_res = ver_results[start:end]
                 group_txt = flat_desc[start:end]
-                
+
                 # 多样性惩罚
                 div_penalty = 0.0
                 if len(group_txt) > 1:
@@ -196,37 +196,85 @@ def train():
             v_rew_t = torch.tensor(all_vlm_rewards, device=device).view(-1, GROUP_SIZE)
             v_adv = (v_rew_t - v_rew_t.mean(1, keepdim=True)) / (v_rew_t.std(1, keepdim=True) + 1e-8)
             
-            # VLM Loss
-            total_vlm_loss = 0
-            for k, (text, img) in enumerate(zip(flat_desc, flat_images)):
-                msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
-                text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
-                inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
-                total_vlm_loss += -v_adv.view(-1)[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
-            
-            accelerator.backward(total_vlm_loss / len(flat_desc))
-            v_opt.step()
+            # VLM Loss - 按组处理避免OOM
+            print(f"[DEBUG-Rank{accelerator.local_process_index}] Starting VLM training for {len(flat_desc)} descriptions in groups of {GROUP_SIZE}", flush=True)
+            v_opt.zero_grad()
+
+            # 按组处理：每组8个描述
+            for group_idx in range(len(images)):
+                start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
+                group_desc = flat_desc[start:end]
+                group_images = flat_images[start:end]
+                group_adv = v_adv[group_idx]  # shape: (GROUP_SIZE,)
+
+                group_loss = 0
+                for k in range(len(group_desc)):
+                    text = group_desc[k]
+                    img = group_images[k]
+                    msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+                    text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
+                    inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
+                    group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
+
+                # 每个组单独反向传播和梯度更新
+                accelerator.backward(group_loss / len(group_desc))
+                v_opt.step()
+                v_opt.zero_grad()
+
+                # 清理GPU内存
+                torch.cuda.empty_cache()
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] Processed group {group_idx+1}/{len(images)}", flush=True)
 
             # === PHASE 4: Verifier 训练 ===
-            ver_opt.zero_grad()
+            print(f"[DEBUG-Rank{accelerator.local_process_index}] Starting Verifier training for {len(flat_desc)} descriptions", flush=True)
+
+            # 先计算全局Verifier奖励用于显示
             all_ver_rewards = []
             for k, res_list in enumerate(ver_results):
                 r_sum = sum(reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], ver_corr_scores[k]) for r in res_list)
                 all_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
-            
-            ver_rew_t = torch.tensor(all_ver_rewards, device=device).view(-1, GROUP_SIZE)
-            ver_adv = (ver_rew_t - ver_rew_t.mean()) / (ver_rew_t.std() + 1e-8)
-            
-            # Verifier Loss
-            total_ver_loss = 0
-            for k, raw in enumerate(ver_raw_resp):
-                total_ver_loss += -ver_adv.view(-1)[k] * verifier.compute_sequence_log_prob(flat_desc[k], raw)
-            
-            accelerator.backward(total_ver_loss / len(flat_desc))
-            ver_opt.step()
+
+            global_ver_rew_t = torch.tensor(all_ver_rewards, device=device)
+            ver_opt.zero_grad()
+
+            # 按组处理Verifier训练
+            for group_idx in range(len(images)):
+                start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
+                group_desc = flat_desc[start:end]
+                group_raw = ver_raw_resp[start:end]
+                group_results = ver_results[start:end]
+                group_corr = ver_corr_scores[start:end]
+
+                # 计算本组的奖励
+                group_ver_rewards = []
+                for k in range(len(group_desc)):
+                    res_list = group_results[k]
+                    r_sum = sum(reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], group_corr[k]) for r in res_list)
+                    group_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
+
+                # 本组优势归一化
+                ver_rew_t = torch.tensor(group_ver_rewards, device=device)
+                ver_adv = (ver_rew_t - ver_rew_t.mean()) / (ver_rew_t.std() + 1e-8)
+
+                # 本组loss
+                group_ver_loss = 0
+                for k in range(len(group_desc)):
+                    group_ver_loss += -ver_adv[k] * verifier.compute_sequence_log_prob(group_desc[k], group_raw[k])
+
+                # 反向传播和更新
+                accelerator.backward(group_ver_loss / len(group_desc))
+                ver_opt.step()
+                ver_opt.zero_grad()
+
+                # 清理GPU内存
+                torch.cuda.empty_cache()
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] Processed Verifier group {group_idx+1}/{len(images)}", flush=True)
+
+            # 用于显示的全局Verifier奖励平均值
+            ver_rew_display = global_ver_rew_t.mean().item()
             
             if accelerator.is_main_process and batch_idx % 5 == 0:
-                pbar.set_postfix({"V_Rew": f"{v_rew_t.mean():.2f}", "Ver_Rew": f"{ver_rew_t.mean():.2f}"})
+                pbar.set_postfix({"V_Rew": f"{v_rew_t.mean().item():.2f}", "Ver_Rew": f"{ver_rew_display:.2f}"})
 
         # Save Checkpoint
         if accelerator.is_main_process:
