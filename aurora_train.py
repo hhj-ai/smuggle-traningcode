@@ -96,42 +96,29 @@ def train():
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # 2. Path Resolution
-    # ... (原有逻辑)
-    
-    # 5. Data Initialization (监控 RAM 消耗)
-    if accelerator.is_main_process:
-        print(f"📁 Scanning dataset: {yfcc_root} ...")
-    dataset = YFCCDataset(yfcc_root)
-    if accelerator.is_main_process:
-        print(f"✅ Dataset ready: {len(dataset)} images found.")
+    vlm_path = os.path.join(args.model_dir, "Qwen3-VL-8B-Instruct")
+    verifier_path = os.path.join(args.model_dir, "DeepSeek-R1-Distill-Qwen-7B")
+    yfcc_root = args.data_dir
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
 
-    # 3. Load EVERYTHING Sequentially (RAM & Timeout Protection)
-    import time, gc
-    vlm = None
-    verifier = None
-    tools = None
-    similarity_model = None
+    if accelerator.is_main_process:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"🚀 AURORA: 8x H200 Performance Mode (Timeout: 4h)")
+
+    # 3. Load Models & Tools in Parallel (H200 High-Speed Mode)
+    if accelerator.is_main_process:
+        print(f"📦 Parallel Initialization Start on all 8 GPUs...")
     
-    for i in range(accelerator.num_processes):
-        if accelerator.local_process_index == i:
-            print(f"📦 [Rank {i}] Sequential Initialization Start...")
-            
-            # A. Load Models & Tools
-            vlm = VLMModel(model_name=vlm_path, device=device)
-            verifier = VerifierModel(model_name=verifier_path, device=device)
-            tools = ToolVerifier(device=device, model_root=args.model_dir)
-            similarity_model = SentenceTransformer(args.minilm_path, device=device)
-            
-            print(f"✅ [Rank {i}] Initialized. Cleaning memory...")
-            gc.collect()
-            torch.cuda.empty_cache()
-            time.sleep(2)
-            
-        # 核心：必须在 if 之外等待，且增加超时容错
-        try:
-            accelerator.wait_for_everyone()
-        except Exception as e:
-            print(f"⚠️  Barrier timeout on Rank {accelerator.local_process_index}: {e}")
+    vlm = VLMModel(model_name=vlm_path, device=device)
+    verifier = VerifierModel(model_name=verifier_path, device=device)
+    tools = ToolVerifier(device=device, model_root=args.model_dir)
+    
+    if not os.path.exists(args.minilm_path):
+        raise FileNotFoundError(f"❌ MiniLM missing: {args.minilm_path}")
+    similarity_model = SentenceTransformer(args.minilm_path, device=device)
+    
+    if accelerator.is_main_process:
+        print(f"✅ All models/tools loaded. Starting training...")
 
     # 4. Initialize Rewards
     reward_calc = RewardCalculator(attack_weight=args.attack_weight)
