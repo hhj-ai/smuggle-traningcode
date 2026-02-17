@@ -6,7 +6,7 @@ MODELS_DIR="$RES_DIR/models"
 DATA_DIR="$RES_DIR/data"
 OUTPUT_DIR="$RES_DIR/output"
 
-# 生产环境原始环境路径 (你的保底路径)
+# 生产环境原始环境路径
 PROD_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/smuggle-traningcode/aurora_env"
 
 echo "📂 [GPU] 检查资源目录: $RES_DIR"
@@ -37,11 +37,29 @@ export HF_HOME="$RES_DIR/hf_cache"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=1
 
-# 4. 激活环境 (优先使用生产路径)
+# 4. 激活环境与严格自检
+ACTIVATED=0
 if [ -f "$PROD_ENV/bin/activate" ]; then
+    echo "🐍 尝试激活生产环境: $PROD_ENV"
     source "$PROD_ENV/bin/activate"
-else
+    ACTIVATED=1
+elif [ -f "$RES_DIR/env/bin/activate" ]; then
+    echo "🐍 尝试激活本地环境: $RES_DIR/env"
     source "$RES_DIR/env/bin/activate"
+    ACTIVATED=1
+fi
+
+if [ $ACTIVATED -eq 0 ]; then
+    echo "🚨 致命错误：找不到可用的虚拟环境！请检查 PROD_ENV 或运行 cpu.sh 创建环境。"
+    exit 1
+fi
+
+# 验证环境有效性
+python -c "import torch; import transformers; print(f'✅ 环境验证通过: Torch {torch.__version__}')" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "🚨 环境激活失败：当前 Python 无法加载 torch/transformers。"
+    echo "   当前 Python: $(which python)"
+    exit 1
 fi
 
 # 5. 启动
