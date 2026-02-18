@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 import os, time, gc, argparse, sys
 from PIL import Image
@@ -430,18 +429,12 @@ def train():
         mem.log("After Verifier load")
         accelerator.wait_for_everyone()
 
-        # --- Tools: 仅主进程加载，自动按显存分散或用户覆盖 ---
-        if accelerator.is_main_process:
-            if tool_devices:
-                print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools (override: {tool_devices})...", flush=True)
-                tools = ToolVerifier(devices=tool_devices, model_root=args.model_dir)
-            else:
-                print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools (auto-assign by VRAM)...", flush=True)
-                tools = ToolVerifier(model_root=args.model_dir)
-            print(f"  ✓ Tools loaded: DINO→{tools.dino_device}, CLIP→{tools.clip_device}, OCR→{tools.ocr_device}", flush=True)
-        else:
-            tools = None
-            print(f"⏭️  [Rank {accelerator.local_process_index}] Skipping tools (rank 0 only)", flush=True)
+        # --- Tools: 所有 rank 加载，各自本地验证（8x 并行加速） ---
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools on {device}...", flush=True)
+        tools = ToolVerifier(device=device, model_root=args.model_dir)
+        print(f"  ✓ [Rank {accelerator.local_process_index}] Tools loaded: DINO→{tools.dino_device}, CLIP→{tools.clip_device}, OCR→{tools.ocr_device}", flush=True)
+        if tool_devices and accelerator.is_main_process:
+            print(f"[WARN] --tool_device ignored: tools now loaded on each rank's own GPU for parallel verification", flush=True)
         mem.cleanup()
         accelerator.wait_for_everyone()
 
@@ -681,60 +674,40 @@ def train():
                     ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
                     local_claims_list.append((claims, flat_paths[i], flat_desc[i]))
 
-            # Gather claims 到 rank 0 进行工具验证
-            gathered_claims = [None] * accelerator.num_processes if accelerator.is_main_process else None
-            dist.gather_object(local_claims_list, gathered_claims, dst=0)
+            # 各 rank 本地工具验证（无需 gather/scatter，8x 并行）
+            img_claims_map = {}
+            for desc_idx, (claims, path, desc) in enumerate(local_claims_list):
+                if path not in img_claims_map:
+                    img_claims_map[path] = []
+                img_claims_map[path].append((desc_idx, claims, desc))
 
-            # Rank 0 执行批量工具验证
-            if accelerator.is_main_process:
-                all_results_by_rank = []
-                for rank_claims in gathered_claims:
-                    # 按图片分组 claims 用于批量验证
-                    img_claims_map = {}  # path -> [(desc_idx, [claims])]
-                    for desc_idx, (claims, path, desc) in enumerate(rank_claims):
-                        if path not in img_claims_map:
-                            img_claims_map[path] = []
-                        img_claims_map[path].append((desc_idx, claims, desc))
+            claims_by_image = []
+            for path, entries in img_claims_map.items():
+                all_claims_for_img = []
+                for _, claims, _ in entries:
+                    all_claims_for_img.extend(claims)
+                if all_claims_for_img:
+                    claims_by_image.append((path, all_claims_for_img))
 
-                    # 构建批量验证输入
-                    claims_by_image = []
-                    for path, entries in img_claims_map.items():
-                        all_claims_for_img = []
-                        for _, claims, _ in entries:
-                            all_claims_for_img.extend(claims)
-                        if all_claims_for_img:
-                            claims_by_image.append((path, all_claims_for_img))
+            try:
+                batch_verdicts = tools.verify_claims_batch(claims_by_image)
+            except Exception as e:
+                print(f"[WARN-R{mem.rank}] Batch tool verify failed: {e}, falling back to per-claim", flush=True)
+                batch_verdicts = {}
 
-                    # 批量验证
-                    try:
-                        batch_verdicts = tools.verify_claims_batch(claims_by_image)
-                    except Exception as e:
-                        print(f"[WARN] Batch tool verify failed: {e}, falling back to per-claim", flush=True)
-                        batch_verdicts = {}
-
-                    # 组装结果
-                    rank_results = []
-                    for desc_idx, (claims, path, desc) in enumerate(rank_claims):
-                        res_per_desc = []
-                        for c in claims:
-                            v = batch_verdicts.get((path, c), None)
-                            if v is None:
-                                # fallback: 逐条验证
-                                try:
-                                    v, _, _ = tools.verify_claim(c, path)
-                                except Exception:
-                                    v = "uncertain"
-                            t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
-                            res_per_desc.append({'verdict': v, 'traceable': t})
-                        rank_results.append(res_per_desc)
-                    all_results_by_rank.append(rank_results)
-            else:
-                all_results_by_rank = None
-
-            # Scatter 验证结果回各 rank
-            local_results = [None]
-            dist.scatter_object_list(local_results, all_results_by_rank, src=0)
-            ver_results = local_results[0]
+            ver_results = []
+            for desc_idx, (claims, path, desc) in enumerate(local_claims_list):
+                res_per_desc = []
+                for c in claims:
+                    v = batch_verdicts.get((path, c), None)
+                    if v is None:
+                        try:
+                            v, _, _ = tools.verify_claim(c, path)
+                        except Exception:
+                            v = "uncertain"
+                    t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
+                    res_per_desc.append({'verdict': v, 'traceable': t})
+                ver_results.append(res_per_desc)
 
             if not no_swap:
                 mem.cleanup()
