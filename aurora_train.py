@@ -448,6 +448,7 @@ def train():
         # --- SentenceTransformer (小模型) ---
         print(f"📦 [Rank {accelerator.local_process_index}] Loading SentenceTransformer...", flush=True)
         similarity_model = SentenceTransformer(args.minilm_path, device=device)
+        similarity_model.max_seq_length = 512  # 显式截断，抑制长序列警告
         print(f"  ✓ [Rank {accelerator.local_process_index}] SentenceTransformer loaded", flush=True)
         mem.cleanup()
         mem.log("All models loaded")
@@ -588,6 +589,7 @@ def train():
             # ============================================================
             # PHASE 1: VLM 生成
             # ============================================================
+            phase_t0 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
             if not no_swap:
                 mem.offload(verifier.model, "Verifier")
@@ -643,6 +645,9 @@ def train():
             # ============================================================
             # PHASE 2: Verifier 提取 + 工具验证
             # ============================================================
+            if accelerator.is_main_process:
+                print(f"[TIMER] Phase1 (VLM gen): {time.time()-phase_t0:.1f}s", flush=True)
+            phase_t1 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
             if not no_swap:
                 mem.offload(vlm.model, "VLM")
@@ -737,6 +742,9 @@ def train():
             # ============================================================
             # PHASE 3: VLM 训练
             # ============================================================
+            if accelerator.is_main_process:
+                print(f"[TIMER] Phase2 (Verify): {time.time()-phase_t1:.1f}s", flush=True)
+            phase_t2 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase3-start")
             if not no_swap:
                 mem.offload_optimizer(ver_opt, "Ver-Opt")
@@ -821,6 +829,9 @@ def train():
             # ============================================================
             # PHASE 4: Verifier 训练
             # ============================================================
+            if accelerator.is_main_process:
+                print(f"[TIMER] Phase3 (VLM train): {time.time()-phase_t2:.1f}s", flush=True)
+            phase_t3 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase4-start")
             if not no_swap:
                 mem.offload_optimizer(v_opt, "VLM-Opt")
@@ -889,6 +900,8 @@ def train():
 
             accelerator.unwrap_model(verifier.model).eval()
             print(f"[MODE-R{mem.rank}] Verifier → .eval()", flush=True)
+            if accelerator.is_main_process:
+                print(f"[TIMER] Phase4 (Ver train): {time.time()-phase_t3:.1f}s", flush=True)
 
             # --- batch 结束 ---
             if not no_swap:
