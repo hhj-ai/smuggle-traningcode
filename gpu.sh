@@ -34,7 +34,7 @@ sleep 2
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HOME="$RES_DIR/hf_cache"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 export OMP_NUM_THREADS=1
 
 # 4. 激活环境与严格自检
@@ -67,7 +67,7 @@ echo "🔥 启动 AURORA 训练..."
 LOG_NAME="train_final_$(date +%Y%m%d_%H%M).log"
 
 setsid accelerate launch \
-    --multi_gpu --num_processes 8 --mixed_precision bf16 \
+    --multi_gpu --num_processes 4 --mixed_precision bf16 \
     aurora_train.py \
     --model_dir "$MODELS_DIR" \
     --data_dir "$DATA_DIR/yfcc100m" \
