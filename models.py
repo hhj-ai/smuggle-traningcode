@@ -42,6 +42,7 @@ class VerifierModel:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -178,6 +179,7 @@ class VLMModel:
 
         self.model.eval()
         self.tokenizer = self.processor.tokenizer
+        self.tokenizer.padding_side = "left"
 
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()

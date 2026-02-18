@@ -546,6 +546,7 @@ def train():
         pbar = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}")
         for batch_idx, (images, image_paths) in enumerate(pbar):
             global_step += 1
+            batch_start_time = time.time()
 
             # ============================================================
             # PHASE 1: VLM 生成
@@ -843,7 +844,8 @@ def train():
                 mem.reload(vlm.model, "VLM")
 
             ver_rew_display = global_ver_rew_t.mean().item()
-            if accelerator.is_main_process and batch_idx % 5 == 0:
+            if accelerator.is_main_process:
+                batch_elapsed = time.time() - batch_start_time
                 free_mib = mem.get_free_mib()
 
                 # 计算训练进度和预估剩余时间
@@ -862,6 +864,7 @@ def train():
                     "Ver_Rew": f"{ver_rew_display:.2f}",
                     "Free": f"{free_mib:.0f}M",
                     "Step": f"{global_step}/{total_steps}",
+                    "s/it": f"{batch_elapsed:.1f}",
                     "ETA": f"{eta_h}h{eta_m:02d}m{eta_s:02d}s",
                 })
 
@@ -870,7 +873,7 @@ def train():
                     epoch_elapsed = time.time() - epoch_start_time
                     print(f"[PROGRESS] Epoch {epoch} Batch {batch_idx}/{total_batches} | "
                           f"Global {global_step}/{total_steps} ({progress_pct:.1f}%) | "
-                          f"Avg {avg_step_time:.1f}s/step | "
+                          f"Avg {avg_step_time:.1f}s/step | this={batch_elapsed:.1f}s | "
                           f"Epoch elapsed {epoch_elapsed/60:.1f}min | "
                           f"ETA {eta_h}h{eta_m:02d}m{eta_s:02d}s | "
                           f"V_Rew={v_rew_t.mean().item():.2f} Ver_Rew={ver_rew_display:.2f}",
