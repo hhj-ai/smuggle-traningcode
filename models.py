@@ -8,6 +8,13 @@ from transformers import (
     AutoConfig
 )
 
+# Flash Attention 2 检测
+try:
+    import flash_attn  # noqa: F401
+    _ATTN_IMPL = "flash_attention_2"
+except ImportError:
+    _ATTN_IMPL = "sdpa"
+
 
 def _unwrap_model(model):
     """Unwrap a model from DDP / accelerate / torch.compile wrappers."""
@@ -41,7 +48,7 @@ class VerifierModel:
             torch_dtype=torch.bfloat16,
             device_map={"": device},
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation=_ATTN_IMPL,
             local_files_only=True
         )
         self.model.eval()
@@ -77,6 +84,72 @@ class VerifierModel:
         if valid_tokens == 0: return torch.tensor(0.0).to(self.device)
         return -outputs.loss * valid_tokens
 
+    def verify_claims_batch(self, descriptions, max_batch=16):
+        """批量提取 claims，内部按 max_batch 分片避免 OOM"""
+        all_claims, all_raws = [], []
+        model_to_gen = _unwrap_model(self.model)
+        prompt_tpl = "Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {}\n\nClaims:"
+        for i in range(0, len(descriptions), max_batch):
+            batch_descs = descriptions[i:i + max_batch]
+            prompts = [prompt_tpl.format(d) for d in batch_descs]
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            with torch.no_grad():
+                outputs = model_to_gen.generate(
+                    **inputs, max_new_tokens=256, do_sample=True,
+                    temperature=0.6, pad_token_id=self.tokenizer.pad_token_id
+                )
+            # 每个样本的 prompt 长度不同（因 padding），用 input_ids 长度截断
+            for j in range(len(batch_descs)):
+                prompt_len = (inputs.attention_mask[j] == 1).sum().item()
+                gen_ids = outputs[j][prompt_len:]
+                raw = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                claims = [line.strip().lstrip('-*').strip() for line in clean.split('\n') if len(line.strip()) > 5]
+                all_claims.append(claims)
+                all_raws.append(raw)
+        return all_claims, all_raws
+
+    def compute_sequence_log_prob_batch(self, prompts, completions, max_batch=16):
+        """批量计算多个 (prompt, completion) 对的 sequence log-prob"""
+        prompt_tpl = "Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {}\n\nClaims:"
+        model_to_use = _unwrap_model(self.model)
+        log_probs = []
+        for i in range(0, len(prompts), max_batch):
+            batch_prompts = prompts[i:i + max_batch]
+            batch_completions = completions[i:i + max_batch]
+            full_texts = [prompt_tpl.format(p) + c for p, c in zip(batch_prompts, batch_completions)]
+            prompt_texts = [prompt_tpl.format(p) for p in batch_prompts]
+            # tokenize full texts with padding
+            full_enc = self.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            # get per-sample prompt lengths (without padding)
+            prompt_lens = [self.tokenizer(pt, return_tensors="pt").input_ids.shape[1] for pt in prompt_texts]
+            # build labels: mask prompt + padding with -100
+            labels = full_enc.input_ids.clone()
+            for j in range(len(batch_prompts)):
+                labels[j, :min(prompt_lens[j], labels.shape[1])] = -100
+            # mask padding tokens
+            labels[full_enc.attention_mask == 0] = -100
+            # forward pass
+            outputs = model_to_use(
+                input_ids=full_enc.input_ids,
+                attention_mask=full_enc.attention_mask,
+                labels=labels
+            )
+            # compute per-sample log-prob (not batch-averaged loss)
+            logits = outputs.logits[:, :-1, :]  # [B, T-1, V]
+            shift_labels = labels[:, 1:]  # [B, T-1]
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            per_token_loss = loss_fct(logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1))
+            per_token_loss = per_token_loss.view(shift_labels.size())  # [B, T-1]
+            for j in range(len(batch_prompts)):
+                valid_mask = shift_labels[j] != -100
+                valid_count = valid_mask.sum()
+                if valid_count == 0:
+                    log_probs.append(torch.tensor(0.0, device=self.device))
+                else:
+                    log_probs.append(-per_token_loss[j][valid_mask].sum())
+        return log_probs
+
 
 class VLMModel:
     def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda",
@@ -99,7 +172,7 @@ class VLMModel:
             torch_dtype=torch.bfloat16,
             device_map={"": device},
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation=_ATTN_IMPL,
             local_files_only=True
         )
 
@@ -136,3 +209,39 @@ class VLMModel:
 
         outputs = model_to_use(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return -outputs.loss * (labels != -100).sum()
+
+    def compute_log_probs_batch(self, images, texts, max_batch=8):
+        """批量计算多个 (image, text) 对的 log-prob"""
+        model_to_use = _unwrap_model(self.model)
+        log_probs = []
+        for i in range(0, len(images), max_batch):
+            batch_imgs = images[i:i + max_batch]
+            batch_txts = texts[i:i + max_batch]
+            # 构造 messages
+            msgs_list = []
+            for img, txt in zip(batch_imgs, batch_txts):
+                msg = [
+                    {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": txt}]}
+                ]
+                msgs_list.append(msg)
+            text_inputs = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False) for m in msgs_list]
+            inputs = self.processor(text=text_inputs, images=batch_imgs, padding=True, return_tensors="pt").to(self.device)
+            labels = inputs.input_ids.clone()
+            # mask padding
+            labels[inputs.attention_mask == 0] = -100
+            # forward
+            outputs = model_to_use(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, labels=labels)
+            # per-sample log-prob
+            logits = outputs.logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            per_token_loss = loss_fct(logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1))
+            per_token_loss = per_token_loss.view(shift_labels.size())
+            for j in range(len(batch_imgs)):
+                valid_mask = shift_labels[j] != -100
+                if valid_mask.sum() == 0:
+                    log_probs.append(torch.tensor(0.0, device=self.device))
+                else:
+                    log_probs.append(-per_token_loss[j][valid_mask].sum())
+        return log_probs

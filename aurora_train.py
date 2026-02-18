@@ -134,8 +134,9 @@ class ResourceAutoTuner:
     def recommend(self, vlm_model, verifier_model,
                   user_batch_size=0, user_group_size=0, user_num_gen=0):
         """
-        测量实际可用显存并返回 (batch_size, group_size, num_gen, num_workers).
+        测量实际可用显存并返回 (batch_size, group_size, num_gen, num_workers, no_swap).
         user_xxx = 0 表示 auto, > 0 表示用户手动指定.
+        no_swap: 两个模型同时在 GPU 时剩余显存 >= 10GB 则为 True.
         """
         # --- 测量 Phase 1 可用显存 (VLM on GPU, Verifier on CPU) ---
         self.mem.offload(verifier_model, "Verifier (auto-tune)")
@@ -149,9 +150,14 @@ class ResourceAutoTuner:
         self.mem.cleanup()
         free_training = self._get_free_gb()
 
+        # --- 测量两个模型同时在 GPU 时的剩余显存 ---
+        self.mem.reload(vlm_model, "VLM (auto-tune both)")
+        self.mem.cleanup()
+        free_both = self._get_free_gb()
+        no_swap = free_both >= 10.0  # 10GB 余量够 KV-cache + 梯度
+
         # 恢复初始状态：VLM on GPU, Verifier on CPU (Phase 1 起始状态)
         self.mem.offload(verifier_model, "Verifier (auto-tune restore)")
-        self.mem.reload(vlm_model, "VLM (auto-tune restore)")
         self.mem.cleanup()
 
         # 取两阶段较小值作为约束基准
@@ -189,13 +195,14 @@ class ResourceAutoTuner:
 
         if self.accelerator.is_main_process:
             print(f"[AUTO-TUNE] GPU: {gpu_name} {total_gb:.0f}GB | "
-                  f"Phase1 free: {free_phase1:.1f}GB | Training free: {free_training:.1f}GB",
+                  f"Phase1 free: {free_phase1:.1f}GB | Training free: {free_training:.1f}GB | "
+                  f"Both free: {free_both:.1f}GB | no_swap={no_swap}",
                   flush=True)
             print(f"[AUTO-TUNE] batch_size={batch_size}, group_size={group_size}, "
                   f"num_gen={num_gen}, num_workers={num_workers}",
                   flush=True)
 
-        return batch_size, group_size, num_gen, num_workers
+        return batch_size, group_size, num_gen, num_workers, no_swap
 
 
 # --- 高性能 Dataset (1.5TB RAM 优化) ---
@@ -465,12 +472,19 @@ def train():
     # 资源自适应调优：DDP 包装完成后测量实际可用显存
     # ============================================================
     tuner = ResourceAutoTuner(device, accelerator, mem)
-    batch_size, GROUP_SIZE, num_gen_default, num_workers = tuner.recommend(
+    batch_size, GROUP_SIZE, num_gen_default, num_workers, no_swap = tuner.recommend(
         vlm.model, verifier.model,
         user_batch_size=args.batch_size,
         user_group_size=args.group_size,
         user_num_gen=args.num_generations,
     )
+
+    # no-swap 模式：两个模型始终在 GPU，不做 offload/reload
+    if no_swap:
+        # recommend() 结束时 verifier 在 CPU，需要 reload
+        mem.reload(verifier.model, "Verifier (no-swap init)")
+        if accelerator.is_main_process:
+            print("[NO-SWAP] Both models pinned on GPU, skipping offload/reload in training loop", flush=True)
 
     # OOM 连续计数器，用于跨 epoch 动态降级
     oom_counter = 0
@@ -534,85 +548,139 @@ def train():
             global_step += 1
 
             # ============================================================
-            # PHASE 1: VLM 生成（Verifier 换出到 CPU 腾显存）
+            # PHASE 1: VLM 生成
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
-            mem.offload(verifier.model, "Verifier")
+            if not no_swap:
+                mem.offload(verifier.model, "Verifier")
 
             flat_desc = []
             flat_images = []
             flat_paths = []
 
             with torch.no_grad():
-                for idx, (img, path) in enumerate(zip(images, image_paths)):
-                    num_gen = num_gen_default
-                    def _generate():
-                        return vlm.generate_description_batch([img], num_generations=num_gen)[0]
-
-                    try:
-                        raw, _ = mem.safe_execute(_generate, retries=1)
-                    except torch.cuda.OutOfMemoryError:
-                        # 降级：减少生成数量
-                        num_gen = max(GROUP_SIZE, num_gen // 2)
-                        print(f"[MEM-R{mem.rank}] ⚠️ Phase1 OOM, 降级生成数: {num_gen}", flush=True)
-                        oom_counter += 1
+                # 批量生成：一次调用所有图片
+                num_gen = num_gen_default
+                def _generate_batch():
+                    return vlm.generate_description_batch(images, num_generations=num_gen)
+                try:
+                    all_results, _ = mem.safe_execute(_generate_batch, retries=1)
+                except torch.cuda.OutOfMemoryError:
+                    # OOM 降级：退回逐图生成
+                    print(f"[MEM-R{mem.rank}] ⚠️ Phase1 batch OOM, falling back to per-image", flush=True)
+                    oom_counter += 1
+                    all_results = []
+                    for idx, (img, path) in enumerate(zip(images, image_paths)):
+                        def _generate_single():
+                            return vlm.generate_description_batch([img], num_generations=num_gen)[0]
                         try:
-                            raw, _ = mem.safe_execute(_generate, retries=1)
+                            raw, _ = mem.safe_execute(_generate_single, retries=1)
                         except torch.cuda.OutOfMemoryError:
-                            print(f"[MEM-R{mem.rank}] ⚠️ Phase1 再次 OOM, 跳过图片 {idx}", flush=True)
+                            num_gen_fallback = max(GROUP_SIZE, num_gen // 2)
+                            print(f"[MEM-R{mem.rank}] ⚠️ Phase1 OOM img {idx}, 降级: {num_gen_fallback}", flush=True)
                             oom_counter += 1
-                            continue
+                            try:
+                                def _gen_reduced():
+                                    return vlm.generate_description_batch([img], num_generations=num_gen_fallback)[0]
+                                raw, _ = mem.safe_execute(_gen_reduced, retries=1)
+                            except torch.cuda.OutOfMemoryError:
+                                print(f"[MEM-R{mem.rank}] ⚠️ Phase1 再次 OOM, 跳过图片 {idx}", flush=True)
+                                oom_counter += 1
+                                all_results.append([])
+                                continue
+                        all_results.append(raw)
 
-                    diverse = select_diverse_descriptions(raw, similarity_model, GROUP_SIZE)
+                for idx, (img, path) in enumerate(zip(images, image_paths)):
+                    raw_list = all_results[idx] if idx < len(all_results) else []
+                    if not raw_list:
+                        continue
+                    diverse = select_diverse_descriptions(raw_list, similarity_model, GROUP_SIZE)
                     flat_desc.extend(diverse)
                     flat_images.extend([img] * len(diverse))
                     flat_paths.extend([path] * len(diverse))
 
-            mem.cleanup()
+            if not no_swap:
+                mem.cleanup()
 
             # ============================================================
             # PHASE 2: Verifier 提取 + 工具验证
-            #   Verifier 换入, VLM 换出
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
-            mem.offload(vlm.model, "VLM")
-            mem.reload(verifier.model, "Verifier")
+            if not no_swap:
+                mem.offload(vlm.model, "VLM")
+                mem.reload(verifier.model, "Verifier")
 
             ver_raw_resp = []
             ver_corr_scores = []
             local_claims_list = []
 
             with torch.no_grad():
-                for i, desc in enumerate(flat_desc):
-                    def _verify():
-                        return verifier.verify_claims(desc)
-                    try:
-                        (claims, raw), _ = mem.safe_execute(_verify, retries=1)
-                    except torch.cuda.OutOfMemoryError:
-                        print(f"[MEM-R{mem.rank}] ⚠️ Verifier OOM on desc {i}, using empty claims", flush=True)
-                        claims, raw = [], ""
+                # 批量提取 claims
+                try:
+                    batch_claims, batch_raws = verifier.verify_claims_batch(flat_desc)
+                except torch.cuda.OutOfMemoryError:
+                    # OOM 降级：逐条提取
+                    print(f"[MEM-R{mem.rank}] ⚠️ Phase2 batch OOM, falling back to per-desc", flush=True)
+                    oom_counter += 1
+                    batch_claims, batch_raws = [], []
+                    for desc in flat_desc:
+                        try:
+                            claims, raw = verifier.verify_claims(desc)
+                        except torch.cuda.OutOfMemoryError:
+                            claims, raw = [], ""
+                        batch_claims.append(claims)
+                        batch_raws.append(raw)
 
+                for i in range(len(flat_desc)):
+                    claims = batch_claims[i]
+                    raw = batch_raws[i]
                     ver_raw_resp.append(raw)
                     ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
-                    local_claims_list.append((claims, flat_paths[i], desc))
+                    local_claims_list.append((claims, flat_paths[i], flat_desc[i]))
 
             # Gather claims 到 rank 0 进行工具验证
             gathered_claims = [None] * accelerator.num_processes if accelerator.is_main_process else None
             dist.gather_object(local_claims_list, gathered_claims, dst=0)
 
-            # Rank 0 执行工具验证
+            # Rank 0 执行批量工具验证
             if accelerator.is_main_process:
                 all_results_by_rank = []
                 for rank_claims in gathered_claims:
+                    # 按图片分组 claims 用于批量验证
+                    img_claims_map = {}  # path -> [(desc_idx, [claims])]
+                    for desc_idx, (claims, path, desc) in enumerate(rank_claims):
+                        if path not in img_claims_map:
+                            img_claims_map[path] = []
+                        img_claims_map[path].append((desc_idx, claims, desc))
+
+                    # 构建批量验证输入
+                    claims_by_image = []
+                    for path, entries in img_claims_map.items():
+                        all_claims_for_img = []
+                        for _, claims, _ in entries:
+                            all_claims_for_img.extend(claims)
+                        if all_claims_for_img:
+                            claims_by_image.append((path, all_claims_for_img))
+
+                    # 批量验证
+                    try:
+                        batch_verdicts = tools.verify_claims_batch(claims_by_image)
+                    except Exception as e:
+                        print(f"[WARN] Batch tool verify failed: {e}, falling back to per-claim", flush=True)
+                        batch_verdicts = {}
+
+                    # 组装结果
                     rank_results = []
-                    for claims, path, desc in rank_claims:
+                    for desc_idx, (claims, path, desc) in enumerate(rank_claims):
                         res_per_desc = []
                         for c in claims:
-                            try:
-                                v, _, _ = tools.verify_claim(c, path)
-                            except Exception as e:
-                                print(f"[WARN] Tool verify failed for claim '{c[:50]}...': {e}", flush=True)
-                                v = "uncertain"
+                            v = batch_verdicts.get((path, c), None)
+                            if v is None:
+                                # fallback: 逐条验证
+                                try:
+                                    v, _, _ = tools.verify_claim(c, path)
+                                except Exception:
+                                    v = "uncertain"
                             t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
                             res_per_desc.append({'verdict': v, 'traceable': t})
                         rank_results.append(res_per_desc)
@@ -625,14 +693,16 @@ def train():
             dist.scatter_object_list(local_results, all_results_by_rank, src=0)
             ver_results = local_results[0]
 
-            mem.cleanup()
+            if not no_swap:
+                mem.cleanup()
 
             # ============================================================
-            # PHASE 3: VLM 训练（VLM 换入, Verifier 换出）
+            # PHASE 3: VLM 训练
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase3-start")
-            mem.reload(vlm.model, "VLM")
-            mem.offload(verifier.model, "Verifier")
+            if not no_swap:
+                mem.reload(vlm.model, "VLM")
+                mem.offload(verifier.model, "Verifier")
             accelerator.unwrap_model(vlm.model).train()
             print(f"[MODE-R{mem.rank}] VLM → .train()", flush=True)
 
@@ -668,14 +738,22 @@ def train():
                 group_images = flat_images[start:end]
                 group_adv = v_adv[group_idx]
 
-                group_loss = 0
-                for k in range(len(group_desc)):
-                    text = group_desc[k]
-                    img = group_images[k]
-                    msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
-                    text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
-                    inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
-                    group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
+                # 批量 log-prob 计算
+                try:
+                    batch_log_probs = vlm.compute_log_probs_batch(group_images, group_desc)
+                    group_loss = sum(-group_adv[k] * batch_log_probs[k] for k in range(len(group_desc)))
+                except torch.cuda.OutOfMemoryError:
+                    # OOM 降级：逐样本计算
+                    print(f"[MEM-R{mem.rank}] ⚠️ Phase3 batch log-prob OOM, per-sample fallback", flush=True)
+                    oom_counter += 1
+                    group_loss = 0
+                    for k in range(len(group_desc)):
+                        text = group_desc[k]
+                        img = group_images[k]
+                        msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+                        text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
+                        inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
+                        group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
 
                 # OOM 安全反向传播
                 def _vlm_backward():
@@ -687,21 +765,21 @@ def train():
                     v_opt.zero_grad()
                     break
 
-                torch.cuda.empty_cache()
-
             v_opt.step()
             v_opt.zero_grad()
-            mem.cleanup()
+            if not no_swap:
+                mem.cleanup()
 
             accelerator.unwrap_model(vlm.model).eval()
             print(f"[MODE-R{mem.rank}] VLM → .eval()", flush=True)
 
             # ============================================================
-            # PHASE 4: Verifier 训练（Verifier 换入, VLM 换出）
+            # PHASE 4: Verifier 训练
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase4-start")
-            mem.offload(vlm.model, "VLM")
-            mem.reload(verifier.model, "Verifier")
+            if not no_swap:
+                mem.offload(vlm.model, "VLM")
+                mem.reload(verifier.model, "Verifier")
             accelerator.unwrap_model(verifier.model).train()
             print(f"[MODE-R{mem.rank}] Verifier → .train()", flush=True)
 
@@ -727,12 +805,20 @@ def train():
                     r_sum = sum(reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], group_corr[k]) for r in res_list)
                     group_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
 
-                ver_rew_t = torch.tensor(group_ver_rewards, device=device)
-                ver_adv = (ver_rew_t - ver_rew_t.mean()) / (ver_rew_t.std() + 1e-8)
+                ver_rew_t_group = torch.tensor(group_ver_rewards, device=device)
+                ver_adv = (ver_rew_t_group - ver_rew_t_group.mean()) / (ver_rew_t_group.std() + 1e-8)
 
-                group_ver_loss = 0
-                for k in range(len(group_desc)):
-                    group_ver_loss += -ver_adv[k] * verifier.compute_sequence_log_prob(group_desc[k], group_raw[k])
+                # 批量 log-prob 计算
+                try:
+                    batch_ver_log_probs = verifier.compute_sequence_log_prob_batch(group_desc, group_raw)
+                    group_ver_loss = sum(-ver_adv[k] * batch_ver_log_probs[k] for k in range(len(group_desc)))
+                except torch.cuda.OutOfMemoryError:
+                    # OOM 降级：逐样本计算
+                    print(f"[MEM-R{mem.rank}] ⚠️ Phase4 batch log-prob OOM, per-sample fallback", flush=True)
+                    oom_counter += 1
+                    group_ver_loss = 0
+                    for k in range(len(group_desc)):
+                        group_ver_loss += -ver_adv[k] * verifier.compute_sequence_log_prob(group_desc[k], group_raw[k])
 
                 # OOM 安全反向传播
                 def _ver_backward():
@@ -744,17 +830,17 @@ def train():
                     ver_opt.zero_grad()
                     break
 
-                torch.cuda.empty_cache()
-
             ver_opt.step()
             ver_opt.zero_grad()
-            mem.cleanup()
+            if not no_swap:
+                mem.cleanup()
 
             accelerator.unwrap_model(verifier.model).eval()
             print(f"[MODE-R{mem.rank}] Verifier → .eval()", flush=True)
 
-            # --- batch 结束：VLM 换回 GPU 准备下一轮 Phase 1 ---
-            mem.reload(vlm.model, "VLM")
+            # --- batch 结束 ---
+            if not no_swap:
+                mem.reload(vlm.model, "VLM")
 
             ver_rew_display = global_ver_rew_t.mean().item()
             if accelerator.is_main_process and batch_idx % 5 == 0:
@@ -793,7 +879,8 @@ def train():
         # Save Checkpoint — 两个模型都要在 GPU 上才能 save
         v_opt.zero_grad()
         ver_opt.zero_grad()
-        mem.reload(verifier.model, "Verifier")
+        if not no_swap:
+            mem.reload(verifier.model, "Verifier")
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             save_p = os.path.join(checkpoint_dir, f"epoch_{epoch}")
@@ -821,6 +908,8 @@ def train():
             print(f"[CKPT] Epoch {epoch} saved to {save_p} (latest → {save_p})", flush=True)
 
         # Epoch 结束汇总
+        if no_swap:
+            mem.cleanup()  # no-swap 模式：每 epoch 结束清理一次
         if accelerator.is_main_process:
             epoch_time = time.time() - epoch_start_time
             total_elapsed = time.time() - training_start_time

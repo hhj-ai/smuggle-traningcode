@@ -4,6 +4,7 @@ from PIL import Image
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, CLIPProcessor, CLIPModel
 import easyocr
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 class ToolVerifier:
     # 各工具模型的估计显存占用 (MiB)
@@ -143,3 +144,79 @@ class ToolVerifier:
             with torch.no_grad():
                 return self.clip_model(**inputs).logits_per_image.softmax(dim=1)[0][0].item()
         except: return 0.0
+
+    def _batch_verify_dino(self, claims, image):
+        """批量 DINO 验证：一张图的多个 claims 拼成一个 query"""
+        if not self.dino_model:
+            return [0.0] * len(claims)
+        try:
+            # DINO 支持用 ". " 分隔多个 text query
+            combined_text = ". ".join(claims) + "."
+            inputs = self.dino_processor(images=image, text=combined_text, return_tensors="pt").to(self.dino_device)
+            with torch.no_grad():
+                outputs = self.dino_model(**inputs)
+            # outputs.logits shape: [1, num_boxes, num_queries]
+            # 每个 claim 对应一个 query，取各 query 的最大 box score
+            logits = outputs.logits.sigmoid()  # [1, num_boxes, num_queries]
+            if logits.dim() == 3 and logits.shape[2] >= len(claims):
+                scores = [logits[0, :, q].max().item() for q in range(len(claims))]
+            else:
+                # fallback: 所有 claims 共享一个 score
+                s = logits.max().item()
+                scores = [s] * len(claims)
+            return scores
+        except:
+            return [0.0] * len(claims)
+
+    def _batch_verify_clip(self, claims, image):
+        """批量 CLIP 验证：一张图的多个 claims 作为 text list"""
+        if not self.clip_model:
+            return [0.0] * len(claims)
+        try:
+            texts = [f"a photo of {c}" for c in claims]
+            inputs = self.clip_processor(text=texts, images=image, return_tensors="pt", padding=True).to(self.clip_device)
+            with torch.no_grad():
+                outputs = self.clip_model(**inputs)
+            # logits_per_image: [1, num_claims]
+            scores = outputs.logits_per_image.softmax(dim=1)[0].tolist()
+            return scores
+        except:
+            return [0.0] * len(claims)
+
+    def verify_claims_batch(self, claims_by_image):
+        """
+        批量验证 claims，按图片分组，每张图只加载一次。
+        claims_by_image: [(image_path, [claim1, claim2, ...]), ...]
+        返回: {(image_path, claim): verdict}
+        """
+        results = {}
+        for img_path, claims in claims_by_image:
+            if not claims:
+                continue
+            if not os.path.exists(img_path):
+                for c in claims:
+                    results[(img_path, c)] = "uncertain"
+                continue
+            try:
+                image = Image.open(img_path).convert("RGB")
+            except:
+                for c in claims:
+                    results[(img_path, c)] = "uncertain"
+                continue
+
+            # 并行执行 DINO 和 CLIP（它们在不同设备上）
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                dino_future = executor.submit(self._batch_verify_dino, claims, image)
+                clip_future = executor.submit(self._batch_verify_clip, claims, image)
+                dino_scores = dino_future.result()
+                clip_scores = clip_future.result()
+
+            for i, c in enumerate(claims):
+                score = max(dino_scores[i], clip_scores[i])
+                if score <= 0.0:
+                    results[(img_path, c)] = "uncertain"
+                elif score > 0.5:
+                    results[(img_path, c)] = "correct"
+                else:
+                    results[(img_path, c)] = "incorrect"
+        return results
