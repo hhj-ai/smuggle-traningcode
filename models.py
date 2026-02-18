@@ -18,13 +18,12 @@ class VerifierModel:
             
         # 针对 14GB RAM 的极致优化：device_map 强制直接分配，防止 CPU 堆积
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            torch_dtype=torch.bfloat16, 
-            device_map={"": device}, 
-            trust_remote_code=True, 
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=True,
-            low_cpu_mem_usage=True
+            local_files_only=True
         )
         self.model.eval()
 
@@ -113,8 +112,7 @@ class VLMModel:
             device_map={"": device},
             trust_remote_code=True,
             attn_implementation="sdpa",
-            local_files_only=True,
-            low_cpu_mem_usage=True
+            local_files_only=True
         )
             
         self.model.eval()

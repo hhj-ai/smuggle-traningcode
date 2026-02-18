@@ -14,17 +14,21 @@ from models import VLMModel, VerifierModel
 from tools import ToolVerifier
 from rewards import RewardCalculator
 
-# --- 极简 Dataset (14GB RAM 保护) ---
+# --- 高性能 Dataset (1.5TB RAM 优化) ---
 class YFCCDataset(Dataset):
-    def __init__(self, root_dir, max_samples=20000):
+    def __init__(self, root_dir):
         self.root_dir = root_dir
         self.image_files = []
         if os.path.exists(root_dir):
-            for i, f in enumerate(os.scandir(root_dir)):
-                if f.is_file() and f.name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    self.image_files.append(f.name)
-                if i >= max_samples: break
+            # 递归扫描所有子目录中的图像文件
+            import glob
+            image_extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
+            for ext in image_extensions:
+                self.image_files.extend(glob.glob(os.path.join(root_dir, '**', ext), recursive=True))
+            # 只保留相对路径
+            self.image_files = [os.path.relpath(f, root_dir) for f in self.image_files]
         self.image_files.sort()
+        print(f"[Dataset] Found {len(self.image_files)} images in {root_dir}")
 
     def __len__(self): return len(self.image_files)
     def __getitem__(self, idx):
@@ -39,14 +43,27 @@ def collate_fn(batch):
 def select_diverse_descriptions(texts, model, target_count):
     if len(texts) <= target_count: return texts
     embeddings = model.encode(texts, convert_to_tensor=True)
-    cos_sim = util.pytorch_cos_sim(embeddings, embeddings)
-    selected_indices = list(range(len(texts)))
+    cos_sim = util.pytorch_cos_sim(embeddings, embeddings)  # [n, n]
+    n = len(texts)
+    selected_indices = list(range(n))
     while len(selected_indices) > target_count:
-        mask = torch.eye(len(selected_indices), device=cos_sim.device).bool()
-        cos_sim.masked_fill_(mask, -1.0)
-        to_remove = torch.argmax(torch.max(cos_sim, dim=1)[0]).item()
-        selected_indices.pop(to_remove)
-        break 
+        # 获取当前选中索引对应的子矩阵
+        sub_cos = cos_sim[selected_indices][:, selected_indices]  # [m, m]
+        m = len(selected_indices)
+        # 将对角线掩码设为-1，避免自相似
+        mask = torch.eye(m, device=cos_sim.device).bool()
+        sub_cos.masked_fill_(mask, -1.0)
+        # 找到最大相似度的位置（忽略对角线）
+        max_val = sub_cos.max()
+        if max_val <= -0.999:  # 所有相似度都很低，随机移除一个
+            rand_idx = torch.randint(0, m, (1,)).item()
+            to_remove = selected_indices[rand_idx]
+        else:
+            max_pos = (sub_cos == max_val).nonzero(as_tuple=False)[0]
+            row_idx = max_pos[0].item()
+            # 移除当前子矩阵中行索引对应的原始索引
+            to_remove = selected_indices[row_idx]
+        selected_indices.remove(to_remove)
     return [texts[i] for i in selected_indices[:target_count]]
 
 def calculate_intra_claim_correlation(claims, model):
@@ -104,13 +121,15 @@ def train():
     print(f"[DEBUG] Rank {accelerator.local_process_index} all models loaded and synchronized", flush=True)
 
     reward_calc = RewardCalculator(attack_weight=args.attack_weight)
-    dataset = YFCCDataset(args.data_dir, max_samples=20000)
+    dataset = YFCCDataset(args.data_dir)
     print(f"[DEBUG] Dataset size: {len(dataset)} images", flush=True)
     if len(dataset) == 0:
         print(f"🛑 ERROR: No images found in {args.data_dir}", flush=True)
         sys.exit(1)
-    # 使用num_workers=0避免分布式环境下的问题
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0, pin_memory=False)
+    # 高性能数据加载设置 (1.5TB RAM优化)
+    num_workers = min(8, os.cpu_count() // 2)  # 根据CPU核心数动态设置
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
+                           num_workers=num_workers, pin_memory=True, prefetch_factor=2)
     print(f"[DEBUG] Dataloader created, batch size: {args.batch_size}", flush=True)
     
     v_opt = torch.optim.AdamW(vlm.model.parameters(), lr=1e-6)
@@ -155,8 +174,6 @@ def train():
 
             with torch.no_grad():
                 for i, desc in enumerate(flat_desc):
-                    # 优化 Prompt：明确指令
-                    prompt = f"Description: {desc}\n\nTask: List all visual claims. Start each claim with '- '."
                     claims, raw = verifier.verify_claims(desc) # Prompt 逻辑在内部封装
                     ver_raw_resp.append(raw)
                     ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
@@ -196,11 +213,14 @@ def train():
             v_rew_t = torch.tensor(all_vlm_rewards, device=device).view(-1, GROUP_SIZE)
             v_adv = (v_rew_t - v_rew_t.mean(1, keepdim=True)) / (v_rew_t.std(1, keepdim=True) + 1e-8)
             
-            # VLM Loss - 按组处理避免OOM
+            # VLM Loss - 梯度累积避免优化器状态OOM
             print(f"[DEBUG-Rank{accelerator.local_process_index}] Starting VLM training for {len(flat_desc)} descriptions in groups of {GROUP_SIZE}", flush=True)
             v_opt.zero_grad()
 
-            # 按组处理：每组8个描述
+            # 梯度累积步数 = batch中的组数
+            gradient_accumulation_steps = len(images)  # 16
+
+            # 按组处理：每组8个描述，累积梯度
             for group_idx in range(len(images)):
                 start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
                 group_desc = flat_desc[start:end]
@@ -216,14 +236,19 @@ def train():
                     inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
                     group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
 
-                # 每个组单独反向传播和梯度更新
-                accelerator.backward(group_loss / len(group_desc))
-                v_opt.step()
-                v_opt.zero_grad()
+                # 关键修改：梯度除以累积步数，但不立即更新优化器
+                # group_loss / len(group_desc) 是每个组的平均损失
+                # 再除以 gradient_accumulation_steps 实现梯度累积缩放
+                accelerator.backward(group_loss / (len(group_desc) * gradient_accumulation_steps))
 
-                # 清理GPU内存
+                # 清理GPU内存但不重置梯度
                 torch.cuda.empty_cache()
-                print(f"[DEBUG-Rank{accelerator.local_process_index}] Processed group {group_idx+1}/{len(images)}", flush=True)
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] Accumulated gradients for group {group_idx+1}/{len(images)}", flush=True)
+
+            # batch结束时一次性更新优化器
+            v_opt.step()
+            v_opt.zero_grad()
+            print(f"[DEBUG-Rank{accelerator.local_process_index}] VLM optimizer updated after {gradient_accumulation_steps} accumulated steps", flush=True)
 
             # === PHASE 4: Verifier 训练 ===
             print(f"[DEBUG-Rank{accelerator.local_process_index}] Starting Verifier training for {len(flat_desc)} descriptions", flush=True)
@@ -237,7 +262,10 @@ def train():
             global_ver_rew_t = torch.tensor(all_ver_rewards, device=device)
             ver_opt.zero_grad()
 
-            # 按组处理Verifier训练
+            # 梯度累积步数 = batch中的组数
+            gradient_accumulation_steps = len(images)  # 16
+
+            # 按组处理Verifier训练，累积梯度
             for group_idx in range(len(images)):
                 start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
                 group_desc = flat_desc[start:end]
@@ -261,14 +289,19 @@ def train():
                 for k in range(len(group_desc)):
                     group_ver_loss += -ver_adv[k] * verifier.compute_sequence_log_prob(group_desc[k], group_raw[k])
 
-                # 反向传播和更新
-                accelerator.backward(group_ver_loss / len(group_desc))
-                ver_opt.step()
-                ver_opt.zero_grad()
+                # 关键修改：梯度除以累积步数，但不立即更新优化器
+                # group_ver_loss / len(group_desc) 是每个组的平均损失
+                # 再除以 gradient_accumulation_steps 实现梯度累积缩放
+                accelerator.backward(group_ver_loss / (len(group_desc) * gradient_accumulation_steps))
 
-                # 清理GPU内存
+                # 清理GPU内存但不重置梯度
                 torch.cuda.empty_cache()
-                print(f"[DEBUG-Rank{accelerator.local_process_index}] Processed Verifier group {group_idx+1}/{len(images)}", flush=True)
+                print(f"[DEBUG-Rank{accelerator.local_process_index}] Accumulated Verifier gradients for group {group_idx+1}/{len(images)}", flush=True)
+
+            # batch结束时一次性更新优化器
+            ver_opt.step()
+            ver_opt.zero_grad()
+            print(f"[DEBUG-Rank{accelerator.local_process_index}] Verifier optimizer updated after {gradient_accumulation_steps} accumulated steps", flush=True)
 
             # 用于显示的全局Verifier奖励平均值
             ver_rew_display = global_ver_rew_t.mean().item()
