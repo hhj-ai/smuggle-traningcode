@@ -15,7 +15,10 @@ echo "📂 [GPU] 检查资源目录: $RES_DIR"
 MISSING=0
 for m in "Qwen3-VL-8B-Instruct" "DeepSeek-R1-Distill-Qwen-7B" "grounding-dino-base" "clip-vit-base-patch32" "minilm"; do
     if [ ! -d "$MODELS_DIR/$m" ]; then
-        echo "❌ 缺失模型: $MODELS_DIR/$m"
+        echo "❌ 缺失模型目录: $MODELS_DIR/$m"
+        MISSING=1
+    elif [ ! -f "$MODELS_DIR/$m/config.json" ]; then
+        echo "❌ 模型目录为空或不完整 (缺少 config.json): $MODELS_DIR/$m"
         MISSING=1
     fi
 done

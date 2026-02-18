@@ -43,19 +43,33 @@ def download_file(url, save_path):
         return False
 
 def load_model(model_path):
-    print(f"🚀 Loading model from: {model_path} ...")
+    print(f"Loading model from: {model_path} ...")
     try:
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, 
-            torch_dtype=torch.bfloat16, 
-            device_map="auto",
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2" # H200 必备加速
-        )
+
+        # Use Qwen3VL-specific class if available, fallback to AutoModelForCausalLM
+        model = None
+        try:
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2"
+            )
+        except (ImportError, Exception):
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2"
+            )
+
         return model, processor
     except Exception as e:
-        print(f"❌ Error loading model: {e}")
+        print(f"Error loading model: {e}")
         return None, None
 
 class POPEEvaluator:
@@ -124,18 +138,24 @@ class POPEEvaluator:
         if missing_images > 0:
             print(f"⚠️ Skipped {missing_images} samples (missing images).")
 
+        total_evaluated = len(eval_data) - missing_images
         precision = tp / (tp + fp + 1e-6)
         recall = tp / (tp + fn + 1e-6)
         f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-        acc = (tp + tn) / (len(eval_data) - missing_images + 1e-6)
-        
-        print(f"📈 [POPE] Acc: {acc:.2f}, F1: {f1:.2f}, Precision: {precision:.2f}")
-        
+        acc = (tp + tn) / (total_evaluated + 1e-6)
+        fpr = fp / (fp + tn + 1e-6)
+        yes_ratio = (tp + fp) / (total_evaluated + 1e-6)
+
+        print(f"[POPE] Acc: {acc:.2f}, F1: {f1:.2f}, Precision: {precision:.2f}, "
+              f"FPR: {fpr:.2f}, Yes-Ratio: {yes_ratio:.2f}")
+
         # Save result summary
         res_file = f"{prefix}pope_score.json"
         with open(res_file, "w") as f:
-            json.dump({"accuracy": acc, "f1": f1, "precision": precision}, f)
-        print(f"✅ POPE scores saved to {res_file}")
+            json.dump({"accuracy": acc, "f1": f1, "precision": precision,
+                       "fpr": fpr, "yes_ratio": yes_ratio,
+                       "tp": tp, "tn": tn, "fp": fp, "fn": fn}, f)
+        print(f"POPE scores saved to {res_file}")
 
 class MMHalEvaluator:
     def __init__(self, data_path, image_dir):
@@ -188,10 +208,35 @@ class MMHalEvaluator:
                 "gt": item.get('gt_answer', '')
             })
         
+        # Simple keyword-matching accuracy against gt_answer
+        correct = 0
+        total_with_gt = 0
+        for r in results:
+            gt = r.get("gt", "").strip().lower()
+            if not gt:
+                continue
+            total_with_gt += 1
+            response_lower = r["response"].strip().lower()
+            # Check if any keyword from the ground truth appears in the response
+            gt_keywords = [w for w in gt.split() if len(w) > 2]
+            if gt_keywords and any(kw in response_lower for kw in gt_keywords):
+                correct += 1
+
+        keyword_acc = correct / (total_with_gt + 1e-6)
+
         out_file = f"{prefix}mmhal_results.json"
-        print(f"✅ MMHal results saved to '{out_file}'. (Skipped {missing_images} images)")
+        summary = {
+            "keyword_accuracy": keyword_acc,
+            "correct": correct,
+            "total_with_gt": total_with_gt,
+            "missing_images": missing_images,
+            "predictions": results,
+        }
+        print(f"[MMHal] Keyword Acc: {keyword_acc:.2f} ({correct}/{total_with_gt}). "
+              f"Skipped {missing_images} images.")
         with open(out_file, "w") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"MMHal results saved to '{out_file}'.")
 
 def evaluate(model_path, image_dir, run_benchmarks, prefix=""):
     model, processor = load_model(model_path)

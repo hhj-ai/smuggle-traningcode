@@ -2,11 +2,29 @@ import torch
 import re
 import os
 from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
-    AutoProcessor, 
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoProcessor,
     AutoConfig
 )
+
+
+def _unwrap_model(model):
+    """Unwrap a model from DDP / accelerate / torch.compile wrappers."""
+    try:
+        from accelerate import unwrap_model
+        model = unwrap_model(model)
+    except ImportError:
+        pass
+
+    while hasattr(model, 'module') and model is not model.module:
+        model = model.module
+
+    if hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+
+    return model
+
 
 class VerifierModel:
     def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
@@ -15,8 +33,7 @@ class VerifierModel:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        # 针对 14GB RAM 的极致优化：device_map 强制直接分配，防止 CPU 堆积
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -27,27 +44,14 @@ class VerifierModel:
         )
         self.model.eval()
 
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+
     def verify_claims(self, description):
         prompt = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {description}\n\nClaims:"
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
-        # 解包逻辑：处理多种包装情况
-        model_to_gen = self.model
-        # 尝试accelerate的unwrap_model（如果可用）
-        try:
-            from accelerate import unwrap_model
-            model_to_gen = unwrap_model(model_to_gen)
-        except ImportError:
-            # 回退方案：手动解包
-            pass
-
-        # 如果unwrap_model没有完全解包，尝试常见属性
-        while hasattr(model_to_gen, 'module') and model_to_gen is not model_to_gen.module:
-            model_to_gen = model_to_gen.module
-
-        # 处理accelerate的_orig_mod属性
-        if hasattr(model_to_gen, '_orig_mod'):
-            model_to_gen = model_to_gen._orig_mod
+        model_to_gen = _unwrap_model(self.model)
 
         with torch.no_grad():
             outputs = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.6, pad_token_id=self.tokenizer.pad_token_id)
@@ -64,23 +68,7 @@ class VerifierModel:
         prompt_len = self.tokenizer(prompt_text, return_tensors="pt").input_ids.shape[1]
         labels[:, :min(prompt_len, labels.shape[1])] = -100
 
-        # 解包逻辑：处理多种包装情况
-        model_to_use = self.model
-        # 尝试accelerate的unwrap_model（如果可用）
-        try:
-            from accelerate import unwrap_model
-            model_to_use = unwrap_model(model_to_use)
-        except ImportError:
-            # 回退方案：手动解包
-            pass
-
-        # 如果unwrap_model没有完全解包，尝试常见属性
-        while hasattr(model_to_use, 'module') and model_to_use is not model_to_use.module:
-            model_to_use = model_to_use.module
-
-        # 处理accelerate的_orig_mod属性
-        if hasattr(model_to_use, '_orig_mod'):
-            model_to_use = model_to_use._orig_mod
+        model_to_use = _unwrap_model(self.model)
 
         outputs = model_to_use(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, labels=labels)
         valid_tokens = (labels != -100).sum()
@@ -92,18 +80,14 @@ class VLMModel:
     def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda"):
         self.device = device
         print(f"Loading VLM: {model_name} on {device}")
-        
+
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-        # 核心修正：多模态模型必须用专用类或 AutoModelForVision2Seq
-        # AutoModelForCausalLM 不支持 Qwen3VLConfig
         from transformers import AutoModel
         try:
-            # 尝试导入官方推荐的类
             from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
             ModelClass = Qwen3VLForConditionalGeneration
         except ImportError:
-            # 回退方案：让 AutoModel 自己去猜（通常会映射到 Vision2Seq）
             ModelClass = AutoModel
 
         self.model = ModelClass.from_pretrained(
@@ -114,11 +98,10 @@ class VLMModel:
             attn_implementation="sdpa",
             local_files_only=True
         )
-            
+
         self.model.eval()
         self.tokenizer = self.processor.tokenizer
-        
-        # 仅开启 Gradient Checkpointing
+
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
 
@@ -133,23 +116,7 @@ class VLMModel:
         inputs = self.processor(text=text_prompts, images=image_inputs, padding=True, return_tensors="pt").to(self.device)
         print(f"[DEBUG-VLM] Inputs prepared, shape: {inputs.input_ids.shape}", flush=True)
 
-        # 解包逻辑：处理多种包装情况（DDP、accelerate等）
-        model_to_gen = self.model
-        # 尝试accelerate的unwrap_model（如果可用）
-        try:
-            from accelerate import unwrap_model
-            model_to_gen = unwrap_model(model_to_gen)
-        except ImportError:
-            # 回退方案：手动解包
-            pass
-
-        # 如果unwrap_model没有完全解包，尝试常见属性
-        while hasattr(model_to_gen, 'module') and model_to_gen is not model_to_gen.module:
-            model_to_gen = model_to_gen.module
-
-        # 处理accelerate的_orig_mod属性
-        if hasattr(model_to_gen, '_orig_mod'):
-            model_to_gen = model_to_gen._orig_mod
+        model_to_gen = _unwrap_model(self.model)
 
         print(f"[DEBUG-VLM] Model unpacked, starting generation", flush=True)
         with torch.no_grad():
@@ -161,24 +128,7 @@ class VLMModel:
         return [texts[i * num_generations : (i + 1) * num_generations] for i in range(len(image_inputs))]
 
     def compute_log_probs(self, input_ids, attention_mask, labels):
-        # 解包逻辑：处理多种包装情况
-        model_to_use = self.model
-        # 尝试accelerate的unwrap_model（如果可用）
-        try:
-            from accelerate import unwrap_model
-            model_to_use = unwrap_model(model_to_use)
-        except ImportError:
-            # 回退方案：手动解包
-            pass
+        model_to_use = _unwrap_model(self.model)
 
-        # 如果unwrap_model没有完全解包，尝试常见属性
-        while hasattr(model_to_use, 'module') and model_to_use is not model_to_use.module:
-            model_to_use = model_to_use.module
-
-        # 处理accelerate的_orig_mod属性
-        if hasattr(model_to_use, '_orig_mod'):
-            model_to_use = model_to_use._orig_mod
-
-        # 需要计算梯度，不使用 torch.no_grad()
         outputs = model_to_use(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return -outputs.loss * (labels != -100).sum()

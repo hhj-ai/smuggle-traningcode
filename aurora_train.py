@@ -111,11 +111,16 @@ class YFCCDataset(Dataset):
         print(f"[Dataset] Found {len(self.image_files)} images in {root_dir}")
 
     def __len__(self): return len(self.image_files)
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retries=0):
+        max_retries = 10
         try:
             path = os.path.join(self.root_dir, self.image_files[idx])
             return Image.open(path).convert("RGB"), path
-        except: return self.__getitem__((idx + 1) % len(self))
+        except Exception as e:
+            if _retries >= max_retries:
+                raise RuntimeError(f"Failed to load image after {max_retries} retries, last idx={idx}: {e}")
+            print(f"[Dataset] Skipping corrupt file {self.image_files[idx]}: {e}", flush=True)
+            return self.__getitem__((idx + 1) % len(self), _retries=_retries + 1)
 
 def collate_fn(batch):
     return [item[0] for item in batch], [item[1] for item in batch]
@@ -163,7 +168,26 @@ def train():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--attack_weight", type=float, default=5.0)
     parser.add_argument("--tool_device", type=str, default=None, help="专用工具GPU (如 cuda:4)，不指定则用rank 0的训练卡")
+    parser.add_argument("--bonus_beta", type=float, default=0.5, help="VLM reward bonus beta")
+    parser.add_argument("--correlation_weight", type=float, default=2.0, help="Verifier correlation penalty weight")
+    parser.add_argument("--length_threshold", type=int, default=20, help="Min description length before penalty")
+    parser.add_argument("--length_penalty", type=float, default=-2.0, help="Penalty for short descriptions")
     args = parser.parse_args()
+
+    # 0. tool_device 校验
+    if args.tool_device is not None:
+        try:
+            td = torch.device(args.tool_device)
+            if td.type == "cuda":
+                if not torch.cuda.is_available():
+                    print(f"[ERROR] --tool_device={args.tool_device} but CUDA is not available", flush=True)
+                    sys.exit(1)
+                if td.index is not None and td.index >= torch.cuda.device_count():
+                    print(f"[ERROR] --tool_device={args.tool_device} invalid: only {torch.cuda.device_count()} GPUs available", flush=True)
+                    sys.exit(1)
+        except Exception as e:
+            print(f"[ERROR] Invalid --tool_device={args.tool_device}: {e}", flush=True)
+            sys.exit(1)
 
     # 1. 稳定性初始化 (高超时保护)
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
@@ -229,7 +253,13 @@ def train():
     accelerator.wait_for_everyone()
     print(f"[DEBUG] Rank {accelerator.local_process_index} all models loaded and synchronized", flush=True)
 
-    reward_calc = RewardCalculator(attack_weight=args.attack_weight)
+    reward_calc = RewardCalculator(
+        attack_weight=args.attack_weight,
+        bonus_beta=args.bonus_beta,
+        correlation_weight=args.correlation_weight,
+        length_threshold=args.length_threshold,
+        length_penalty=args.length_penalty,
+    )
     dataset = YFCCDataset(args.data_dir)
     print(f"[DEBUG] Dataset size: {len(dataset)} images", flush=True)
     if len(dataset) == 0:
@@ -355,7 +385,11 @@ def train():
                     for claims, path, desc in rank_claims:
                         res_per_desc = []
                         for c in claims:
-                            v, _, _ = tools.verify_claim(c, path)
+                            try:
+                                v, _, _ = tools.verify_claim(c, path)
+                            except Exception as e:
+                                print(f"[WARN] Tool verify failed for claim '{c[:50]}...': {e}", flush=True)
+                                v = "uncertain"
                             t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
                             res_per_desc.append({'verdict': v, 'traceable': t})
                         rank_results.append(res_per_desc)
@@ -376,6 +410,8 @@ def train():
             mem.log(f"E{epoch}B{batch_idx} Phase3-start")
             mem.reload(vlm.model, "VLM")
             mem.offload(verifier.model, "Verifier")
+            accelerator.unwrap_model(vlm.model).train()
+            print(f"[MODE-R{mem.rank}] VLM → .train()", flush=True)
 
             all_vlm_rewards = []
             for i in range(len(images)):
@@ -434,12 +470,17 @@ def train():
             v_opt.zero_grad()
             mem.cleanup()
 
+            accelerator.unwrap_model(vlm.model).eval()
+            print(f"[MODE-R{mem.rank}] VLM → .eval()", flush=True)
+
             # ============================================================
             # PHASE 4: Verifier 训练（Verifier 换入, VLM 换出）
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase4-start")
             mem.offload(vlm.model, "VLM")
             mem.reload(verifier.model, "Verifier")
+            accelerator.unwrap_model(verifier.model).train()
+            print(f"[MODE-R{mem.rank}] Verifier → .train()", flush=True)
 
             all_ver_rewards = []
             for k, res_list in enumerate(ver_results):
@@ -486,6 +527,9 @@ def train():
             ver_opt.zero_grad()
             mem.cleanup()
 
+            accelerator.unwrap_model(verifier.model).eval()
+            print(f"[MODE-R{mem.rank}] Verifier → .eval()", flush=True)
+
             # --- batch 结束：VLM 换回 GPU 准备下一轮 Phase 1 ---
             mem.reload(vlm.model, "VLM")
 
@@ -499,6 +543,8 @@ def train():
                 })
 
         # Save Checkpoint — 两个模型都要在 GPU 上才能 save
+        v_opt.zero_grad()
+        ver_opt.zero_grad()
         mem.reload(verifier.model, "Verifier")
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
