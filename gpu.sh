@@ -40,14 +40,15 @@ export HF_HOME="$RES_DIR/hf_cache"
 export OMP_NUM_THREADS=1
 
 # ============================================================
-# 4. 自动检测 GPU 显存，智能分配训练卡与工具卡
+# 4. 自动检测 GPU 显存，筛选训练卡
+#    工具模型分配由 Python 运行时自动按显存决定
 # ============================================================
 TRAIN_THRESHOLD_MIB=80000   # 训练卡至少需要 80 GiB 空闲
 TOOL_THRESHOLD_MIB=4000     # 工具卡至少需要 4 GiB 空闲 (DINO+CLIP ~1.5GB)
 
 echo "🔍 自动检测 GPU 显存占用..."
 TRAIN_GPUS=()
-TOOL_GPU_CANDIDATES=()
+EXTRA_GPUS=()
 
 for gpu_id in 0 1 2 3 4 5 6 7; do
     free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gpu_id" 2>/dev/null | tr -d ' ')
@@ -60,7 +61,7 @@ for gpu_id in 0 1 2 3 4 5 6 7; do
     if [ "$free_mib" -ge "$TRAIN_THRESHOLD_MIB" ]; then
         TRAIN_GPUS+=("$gpu_id")
     elif [ "$free_mib" -ge "$TOOL_THRESHOLD_MIB" ]; then
-        TOOL_GPU_CANDIDATES+=("$gpu_id")
+        EXTRA_GPUS+=("$gpu_id")
     else
         echo "    ⚠️  GPU $gpu_id 空闲不足，跳过"
     fi
@@ -76,32 +77,14 @@ fi
 echo ""
 echo "✅ 可用训练 GPU: [${TRAIN_GPUS[*]}] (共 ${NUM_TRAIN} 张)"
 
-# 决定工具设备：优先用显存不够训练但够跑工具的卡
-TOOL_DEVICE_ARG=""
-if [ ${#TOOL_GPU_CANDIDATES[@]} -gt 0 ]; then
-    TOOL_PHYS_GPU=${TOOL_GPU_CANDIDATES[0]}
-    # CUDA_VISIBLE_DEVICES: 训练卡在前，工具卡在末尾
-    ALL_GPUS=("${TRAIN_GPUS[@]}" "$TOOL_PHYS_GPU")
-    CUDA_VIS=$(IFS=,; echo "${ALL_GPUS[*]}")
-    # 工具卡的逻辑索引 = 训练卡数量 (0-indexed)
-    TOOL_DEVICE_ARG="--tool_device cuda:${NUM_TRAIN}"
-    echo "🔧 工具专用 GPU: 物理 GPU $TOOL_PHYS_GPU → 逻辑 cuda:${NUM_TRAIN}"
-else
-    # 没有专用工具卡，选训练卡中显存最空闲的那张
-    CUDA_VIS=$(IFS=,; echo "${TRAIN_GPUS[*]}")
-    BEST_FREE=0
-    BEST_IDX=0
-    for i in "${!TRAIN_GPUS[@]}"; do
-        gid=${TRAIN_GPUS[$i]}
-        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gid" 2>/dev/null | tr -d ' ')
-        if [ "$free_mib" -gt "$BEST_FREE" ]; then
-            BEST_FREE=$free_mib
-            BEST_IDX=$i
-        fi
-    done
-    TOOL_DEVICE_ARG="--tool_device cuda:${BEST_IDX}"
-    echo "🔧 无专用工具卡，选最空闲训练 GPU: 物理 GPU ${TRAIN_GPUS[$BEST_IDX]} (${BEST_FREE} MiB free) → 逻辑 cuda:${BEST_IDX}"
+# 将训练卡 + 有余量的额外卡都放入 CUDA_VISIBLE_DEVICES，
+# 工具模型由 Python 运行时自动查询各卡空闲显存并分散加载
+ALL_VISIBLE=("${TRAIN_GPUS[@]}" "${EXTRA_GPUS[@]}")
+CUDA_VIS=$(IFS=,; echo "${ALL_VISIBLE[*]}")
+if [ ${#EXTRA_GPUS[@]} -gt 0 ]; then
+    echo "🔧 额外可见 GPU (供工具自动分配): [${EXTRA_GPUS[*]}]"
 fi
+echo "🔧 工具模型将由 Python 运行时自动按显存分散到最空闲的卡"
 
 export CUDA_VISIBLE_DEVICES=$CUDA_VIS
 echo "📋 CUDA_VISIBLE_DEVICES=$CUDA_VIS"
@@ -157,6 +140,6 @@ setsid accelerate launch \
     --data_dir "$DATA_DIR/yfcc100m" \
     --minilm_path "$MODELS_DIR/minilm" \
     --output_dir "$OUTPUT_DIR" \
-    $TOOL_DEVICE_ARG $RESUME_ARG > "$LOG_NAME" 2>&1 < /dev/null &
+    $RESUME_ARG > "$LOG_NAME" 2>&1 < /dev/null &
 
 echo "🚀 已后台启动。日志: tail -n +1 -f $LOG_NAME"

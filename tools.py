@@ -6,8 +6,62 @@ import easyocr
 import numpy as np
 
 class ToolVerifier:
-    def __init__(self, device="cuda", model_root="./models"):
-        self.device = device
+    # 各工具模型的估计显存占用 (MiB)
+    TOOL_MEM_MIB = {"dino": 850, "clip": 650, "ocr": 200}
+
+    @staticmethod
+    def auto_assign_devices():
+        """查询所有可见 GPU 空闲显存，按空闲降序分配 DINO/CLIP/OCR 到最空闲的卡"""
+        if not torch.cuda.is_available():
+            return {"dino": "cpu", "clip": "cpu", "ocr": "cpu"}
+
+        n_gpus = torch.cuda.device_count()
+        if n_gpus == 0:
+            return {"dino": "cpu", "clip": "cpu", "ocr": "cpu"}
+
+        # 查询各卡空闲显存
+        free = {}
+        for i in range(n_gpus):
+            f, _ = torch.cuda.mem_get_info(i)
+            free[i] = f / (1024 * 1024)  # MiB
+
+        # 按显存需求从大到小分配：DINO > CLIP > OCR
+        assignment = {}
+        for tool in ["dino", "clip", "ocr"]:
+            need = ToolVerifier.TOOL_MEM_MIB[tool]
+            # 选空闲最多的卡
+            best_gpu = max(free, key=free.get)
+            if free[best_gpu] >= need:
+                assignment[tool] = f"cuda:{best_gpu}"
+                free[best_gpu] -= need  # 扣减预估占用
+            else:
+                assignment[tool] = "cpu"
+
+        return assignment
+
+    def __init__(self, model_root="./models", device=None, devices=None):
+        """
+        devices: 显式设备列表 (轮询分配)，用于 CLI 覆盖。
+        device:  单设备回退。
+        两者都不指定时自动按显存分配。
+        """
+        if devices and len(devices) > 0:
+            dev_list = [torch.device(d) for d in devices]
+            assign = {
+                "dino": dev_list[0 % len(dev_list)],
+                "clip": dev_list[2 % len(dev_list)],
+                "ocr":  dev_list[1 % len(dev_list)],
+            }
+        elif device is not None:
+            d = torch.device(device)
+            assign = {"dino": d, "clip": d, "ocr": d}
+        else:
+            raw = self.auto_assign_devices()
+            assign = {k: torch.device(v) for k, v in raw.items()}
+
+        self.dino_device = assign["dino"]
+        self.ocr_device = assign["ocr"]
+        self.clip_device = assign["clip"]
         
         def find_path(name):
             # 自动搜索 model_root 下包含 name 的文件夹
@@ -23,11 +77,12 @@ class ToolVerifier:
         clip_path = find_path("clip-vit-base-patch32")
         
         print(f"🔧 [Tools] Loading tools from: {model_root}")
-        
+        print(f"   Devices: DINO→{self.dino_device}, OCR→{self.ocr_device}, CLIP→{self.clip_device}")
+
         # 1. DINO
         try:
             self.dino_processor = AutoProcessor.from_pretrained(dino_path, local_files_only=True)
-            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path, local_files_only=True).to(device)
+            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path, local_files_only=True).to(self.dino_device)
             self.dino_model.eval()
             print("   - DINO Ready ✅")
         except Exception as e:
@@ -35,15 +90,15 @@ class ToolVerifier:
             self.dino_model = None
 
         # 2. EasyOCR
-        use_gpu = torch.cuda.is_available() and "cuda" in str(device)
+        use_gpu = torch.cuda.is_available() and "cuda" in str(self.ocr_device)
         try:
             self.ocr_reader = easyocr.Reader(['en'], gpu=use_gpu)
             print(f"   - OCR Ready (GPU: {use_gpu}) ✅")
         except: self.ocr_reader = None
-        
+
         # 3. CLIP
         try:
-            self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(device)
+            self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(self.clip_device)
             self.clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
             self.clip_model.eval()
             print("   - CLIP Ready ✅")
@@ -74,7 +129,7 @@ class ToolVerifier:
     def _verify_dino(self, claim, image):
         if not self.dino_model: return 0.0
         try:
-            inputs = self.dino_processor(images=image, text=claim+".", return_tensors="pt").to(self.device)
+            inputs = self.dino_processor(images=image, text=claim+".", return_tensors="pt").to(self.dino_device)
             with torch.no_grad():
                 outputs = self.dino_model(**inputs)
             # 简化版 Score 提取
@@ -84,7 +139,7 @@ class ToolVerifier:
     def _verify_clip(self, claim, image):
         if not self.clip_model: return 0.0
         try:
-            inputs = self.clip_processor(text=[f"a photo of {claim}"], images=image, return_tensors="pt", padding=True).to(self.device)
+            inputs = self.clip_processor(text=[f"a photo of {claim}"], images=image, return_tensors="pt", padding=True).to(self.clip_device)
             with torch.no_grad():
                 return self.clip_model(**inputs).logits_per_image.softmax(dim=1)[0][0].item()
         except: return 0.0

@@ -185,7 +185,7 @@ class ResourceAutoTuner:
 
         # GPU 信息
         gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else "N/A"
-        total_gb = torch.cuda.get_device_properties(self.device).total_mem / (1024 ** 3) if torch.cuda.is_available() else 0
+        total_gb = torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3) if torch.cuda.is_available() else 0
 
         if self.accelerator.is_main_process:
             print(f"[AUTO-TUNE] GPU: {gpu_name} {total_gb:.0f}GB | "
@@ -273,7 +273,7 @@ def train():
     parser.add_argument("--group_size", type=int, default=0, help="GRPO group size per image (0=auto)")
     parser.add_argument("--num_generations", type=int, default=0, help="VLM candidate generations per image (0=auto)")
     parser.add_argument("--attack_weight", type=float, default=5.0)
-    parser.add_argument("--tool_device", type=str, default=None, help="专用工具GPU (如 cuda:4)，不指定则用rank 0的训练卡")
+    parser.add_argument("--tool_device", type=str, default=None, help="工具GPU覆盖，逗号分隔 (如 cuda:4,cuda:5)；不指定则自动按显存分配")
     parser.add_argument("--bonus_beta", type=float, default=0.5, help="VLM reward bonus beta")
     parser.add_argument("--correlation_weight", type=float, default=2.0, help="Verifier correlation penalty weight")
     parser.add_argument("--length_threshold", type=int, default=20, help="Min description length before penalty")
@@ -282,20 +282,23 @@ def train():
                         help="Checkpoint 目录路径 (如 checkpoints/epoch_2)，或 'latest' 自动查找最新")
     args = parser.parse_args()
 
-    # 0. tool_device 校验
+    # 0. tool_device 校验（支持逗号分隔多设备）
+    tool_devices = None
     if args.tool_device is not None:
-        try:
-            td = torch.device(args.tool_device)
-            if td.type == "cuda":
-                if not torch.cuda.is_available():
-                    print(f"[ERROR] --tool_device={args.tool_device} but CUDA is not available", flush=True)
-                    sys.exit(1)
-                if td.index is not None and td.index >= torch.cuda.device_count():
-                    print(f"[ERROR] --tool_device={args.tool_device} invalid: only {torch.cuda.device_count()} GPUs available", flush=True)
-                    sys.exit(1)
-        except Exception as e:
-            print(f"[ERROR] Invalid --tool_device={args.tool_device}: {e}", flush=True)
-            sys.exit(1)
+        tool_devices = [s.strip() for s in args.tool_device.split(",") if s.strip()]
+        for td_str in tool_devices:
+            try:
+                td = torch.device(td_str)
+                if td.type == "cuda":
+                    if not torch.cuda.is_available():
+                        print(f"[ERROR] --tool_device contains {td_str} but CUDA is not available", flush=True)
+                        sys.exit(1)
+                    if td.index is not None and td.index >= torch.cuda.device_count():
+                        print(f"[ERROR] --tool_device {td_str} invalid: only {torch.cuda.device_count()} GPUs available", flush=True)
+                        sys.exit(1)
+            except Exception as e:
+                print(f"[ERROR] Invalid device in --tool_device: {td_str}: {e}", flush=True)
+                sys.exit(1)
 
     # 1. 稳定性初始化 (高超时保护)
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
@@ -383,12 +386,15 @@ def train():
         mem.log("After Verifier load")
         accelerator.wait_for_everyone()
 
-        # --- Tools: 仅主进程加载，支持专用工具卡 ---
+        # --- Tools: 仅主进程加载，自动按显存分散或用户覆盖 ---
         if accelerator.is_main_process:
-            tool_dev = torch.device(args.tool_device) if args.tool_device else device
-            print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools on {tool_dev}...", flush=True)
-            tools = ToolVerifier(device=tool_dev, model_root=args.model_dir)
-            print(f"  ✓ Tools loaded on {tool_dev} (rank 0 only)", flush=True)
+            if tool_devices:
+                print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools (override: {tool_devices})...", flush=True)
+                tools = ToolVerifier(devices=tool_devices, model_root=args.model_dir)
+            else:
+                print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools (auto-assign by VRAM)...", flush=True)
+                tools = ToolVerifier(model_root=args.model_dir)
+            print(f"  ✓ Tools loaded: DINO→{tools.dino_device}, CLIP→{tools.clip_device}, OCR→{tools.ocr_device}", flush=True)
         else:
             tools = None
             print(f"⏭️  [Rank {accelerator.local_process_index}] Skipping tools (rank 0 only)", flush=True)
