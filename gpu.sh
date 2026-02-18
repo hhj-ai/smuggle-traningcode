@@ -124,7 +124,18 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 6. 启动
+# 6. 断点续传检测
+RESUME_ARG=""
+LATEST_CKPT="$OUTPUT_DIR/checkpoints/latest"
+if [ -L "$LATEST_CKPT" ] || [ -d "$LATEST_CKPT" ]; then
+    if [ -f "$(realpath "$LATEST_CKPT")/training_state.pt" ]; then
+        echo "🔄 检测到已有 checkpoint: $(realpath "$LATEST_CKPT")"
+        echo "   将自动从上次中断处继续训练"
+        RESUME_ARG="--resume_from latest"
+    fi
+fi
+
+# 7. 启动
 echo "🔥 启动 AURORA 训练..."
 LOG_NAME="train_final_$(date +%Y%m%d_%H%M).log"
 
@@ -135,6 +146,6 @@ setsid accelerate launch \
     --data_dir "$DATA_DIR/yfcc100m" \
     --minilm_path "$MODELS_DIR/minilm" \
     --output_dir "$OUTPUT_DIR" \
-    --batch_size 16 $TOOL_DEVICE_ARG > "$LOG_NAME" 2>&1 < /dev/null &
+    $TOOL_DEVICE_ARG $RESUME_ARG > "$LOG_NAME" 2>&1 < /dev/null &
 
 echo "🚀 已后台启动。日志: tail -n +1 -f $LOG_NAME"

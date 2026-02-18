@@ -27,10 +27,12 @@ def _unwrap_model(model):
 
 
 class VerifierModel:
-    def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda"):
+    def __init__(self, model_name="./models/DeepSeek-R1-Distill-Qwen-7B", device="cuda",
+                 tokenizer_name=None):
         self.device = device
+        tokenizer_path = tokenizer_name or model_name
         print(f"Loading Verifier: {model_name} on {device}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -77,11 +79,13 @@ class VerifierModel:
 
 
 class VLMModel:
-    def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda"):
+    def __init__(self, model_name="./models/Qwen3-VL-8B-Instruct", device="cuda",
+                 processor_name=None):
         self.device = device
+        processor_path = processor_name or model_name
         print(f"Loading VLM: {model_name} on {device}")
 
-        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self.processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
 
         from transformers import AutoModel
         try:

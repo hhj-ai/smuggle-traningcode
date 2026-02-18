@@ -94,6 +94,110 @@ class GPUMemoryManager:
                     raise
 
 
+# ============================================================
+# GPU 资源自适应调优器
+# ============================================================
+class ResourceAutoTuner:
+    """根据实际 GPU 显存自动推荐 batch_size / group_size / num_gen"""
+
+    # (min_free_gb, batch_size, group_size, num_gen)
+    TIERS = [
+        (40, 16, 8, 10),
+        (30, 12, 6,  8),
+        (20,  8, 4,  6),
+        (12,  4, 4,  5),
+        ( 0,  2, 2,  3),
+    ]
+
+    SAFETY_MARGIN_GB = 2.0  # 安全余量
+
+    def __init__(self, device, accelerator, mem_manager):
+        self.device = device
+        self.accelerator = accelerator
+        self.mem = mem_manager
+        self.rank = accelerator.local_process_index
+
+    def _get_free_gb(self):
+        if not torch.cuda.is_available():
+            return 80.0  # 假设充足
+        free, _ = torch.cuda.mem_get_info(self.device)
+        return free / (1024 ** 3)
+
+    def _pick_tier(self, free_gb):
+        working = free_gb - self.SAFETY_MARGIN_GB
+        for min_free, bs, gs, ng in self.TIERS:
+            if working >= min_free:
+                return bs, gs, ng
+        # 兜底
+        return 2, 2, 3
+
+    def recommend(self, vlm_model, verifier_model,
+                  user_batch_size=0, user_group_size=0, user_num_gen=0):
+        """
+        测量实际可用显存并返回 (batch_size, group_size, num_gen, num_workers).
+        user_xxx = 0 表示 auto, > 0 表示用户手动指定.
+        """
+        # --- 测量 Phase 1 可用显存 (VLM on GPU, Verifier on CPU) ---
+        self.mem.offload(verifier_model, "Verifier (auto-tune)")
+        self.mem.reload(vlm_model, "VLM (auto-tune)")
+        self.mem.cleanup()
+        free_phase1 = self._get_free_gb()
+
+        # --- 测量 Phase 3/4 可用显存 (Verifier on GPU, VLM on CPU) ---
+        self.mem.offload(vlm_model, "VLM (auto-tune)")
+        self.mem.reload(verifier_model, "Verifier (auto-tune)")
+        self.mem.cleanup()
+        free_training = self._get_free_gb()
+
+        # 恢复初始状态：VLM on GPU, Verifier on CPU (Phase 1 起始状态)
+        self.mem.offload(verifier_model, "Verifier (auto-tune restore)")
+        self.mem.reload(vlm_model, "VLM (auto-tune restore)")
+        self.mem.cleanup()
+
+        # 取两阶段较小值作为约束基准
+        effective_free = min(free_phase1, free_training)
+        rec_bs, rec_gs, rec_ng = self._pick_tier(effective_free)
+
+        # num_workers: CPU 核数相关
+        num_workers = min(8, max(1, os.cpu_count() // 2))
+
+        # 应用用户覆盖
+        batch_size = user_batch_size if user_batch_size > 0 else rec_bs
+        group_size = user_group_size if user_group_size > 0 else rec_gs
+        num_gen = user_num_gen if user_num_gen > 0 else rec_ng
+
+        # 约束校验
+        if group_size < 2:
+            group_size = 2
+        if num_gen < group_size:
+            num_gen = group_size
+        if batch_size % group_size != 0:
+            # 向下对齐到 group_size 的倍数
+            batch_size = max(group_size, (batch_size // group_size) * group_size)
+
+        # 用户指定值超过推荐值时发出警告
+        if user_batch_size > 0 and user_batch_size > rec_bs:
+            print(f"[AUTO-TUNE] WARNING: user batch_size={user_batch_size} > recommended={rec_bs}, OOM risk", flush=True)
+        if user_group_size > 0 and user_group_size > rec_gs:
+            print(f"[AUTO-TUNE] WARNING: user group_size={user_group_size} > recommended={rec_gs}, OOM risk", flush=True)
+        if user_num_gen > 0 and user_num_gen > rec_ng:
+            print(f"[AUTO-TUNE] WARNING: user num_gen={user_num_gen} > recommended={rec_ng}, OOM risk", flush=True)
+
+        # GPU 信息
+        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else "N/A"
+        total_gb = torch.cuda.get_device_properties(self.device).total_mem / (1024 ** 3) if torch.cuda.is_available() else 0
+
+        if self.accelerator.is_main_process:
+            print(f"[AUTO-TUNE] GPU: {gpu_name} {total_gb:.0f}GB | "
+                  f"Phase1 free: {free_phase1:.1f}GB | Training free: {free_training:.1f}GB",
+                  flush=True)
+            print(f"[AUTO-TUNE] batch_size={batch_size}, group_size={group_size}, "
+                  f"num_gen={num_gen}, num_workers={num_workers}",
+                  flush=True)
+
+        return batch_size, group_size, num_gen, num_workers
+
+
 # --- 高性能 Dataset (1.5TB RAM 优化) ---
 class YFCCDataset(Dataset):
     def __init__(self, root_dir):
@@ -165,13 +269,17 @@ def train():
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--minilm_path", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=0, help="DataLoader batch size (0=auto)")
+    parser.add_argument("--group_size", type=int, default=0, help="GRPO group size per image (0=auto)")
+    parser.add_argument("--num_generations", type=int, default=0, help="VLM candidate generations per image (0=auto)")
     parser.add_argument("--attack_weight", type=float, default=5.0)
     parser.add_argument("--tool_device", type=str, default=None, help="专用工具GPU (如 cuda:4)，不指定则用rank 0的训练卡")
     parser.add_argument("--bonus_beta", type=float, default=0.5, help="VLM reward bonus beta")
     parser.add_argument("--correlation_weight", type=float, default=2.0, help="Verifier correlation penalty weight")
     parser.add_argument("--length_threshold", type=int, default=20, help="Min description length before penalty")
     parser.add_argument("--length_penalty", type=float, default=-2.0, help="Penalty for short descriptions")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Checkpoint 目录路径 (如 checkpoints/epoch_2)，或 'latest' 自动查找最新")
     args = parser.parse_args()
 
     # 0. tool_device 校验
@@ -204,24 +312,72 @@ def train():
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"🚀 AURORA Training")
 
+    # ============================================================
+    # 断点续传：解析 resume 路径
+    # ============================================================
+    resume_dir = None
+    resume_epoch = -1  # -1 表示从头开始，训练从 resume_epoch+1 开始
+    if args.resume_from:
+        if args.resume_from == "latest":
+            latest_link = os.path.join(checkpoint_dir, "latest")
+            if os.path.exists(latest_link):
+                resume_dir = os.path.realpath(latest_link)
+            else:
+                # 没有 latest 链接，扫描所有 epoch_* 目录找最新的
+                existing = sorted(
+                    [d for d in os.listdir(checkpoint_dir)
+                     if d.startswith("epoch_") and os.path.isdir(os.path.join(checkpoint_dir, d))],
+                    key=lambda x: int(x.split("_")[1])
+                ) if os.path.isdir(checkpoint_dir) else []
+                if existing:
+                    resume_dir = os.path.join(checkpoint_dir, existing[-1])
+        else:
+            resume_dir = os.path.abspath(args.resume_from)
+
+        if resume_dir and os.path.isdir(resume_dir):
+            state_file = os.path.join(resume_dir, "training_state.pt")
+            if os.path.isfile(state_file):
+                # 从 training_state.pt 读取 epoch
+                _tmp = torch.load(state_file, map_location="cpu", weights_only=False)
+                resume_epoch = _tmp["epoch"]
+                del _tmp
+                if accelerator.is_main_process:
+                    print(f"[RESUME] 找到 checkpoint: {resume_dir} (epoch {resume_epoch})", flush=True)
+                    print(f"[RESUME] 训练将从 epoch {resume_epoch + 1} 继续", flush=True)
+            else:
+                if accelerator.is_main_process:
+                    print(f"[RESUME] 警告: {state_file} 不存在，无法恢复训练状态", flush=True)
+                resume_dir = None
+        else:
+            if accelerator.is_main_process:
+                print(f"[RESUME] 警告: 目录 {resume_dir} 不存在，从头开始训练", flush=True)
+            resume_dir = None
+
     # 初始化显存管理器
     mem = GPUMemoryManager(device, accelerator)
 
     # 3. 顺序加载 + 同步屏障（减少峰值内存与IO争抢）
     vlm, verifier, tools, similarity_model = None, None, None, None
+
+    # 确定模型加载路径：有 checkpoint 则从 checkpoint 加载权重，processor/tokenizer 仍用原始路径
+    vlm_load_path = os.path.join(resume_dir, "vlm") if resume_dir else vlm_path
+    ver_load_path = os.path.join(resume_dir, "verifier") if resume_dir else verifier_path
+
     try:
         # --- VLM (最大模型，优先加载) ---
         mem.log("Before VLM load")
-        print(f"📦 [Rank {accelerator.local_process_index}] Loading VLM...", flush=True)
-        vlm = VLMModel(model_name=vlm_path, device=device)
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading VLM from {vlm_load_path}...", flush=True)
+        vlm = VLMModel(model_name=vlm_load_path, device=device,
+                        processor_name=vlm_path if resume_dir else None)
         print(f"  ✓ [Rank {accelerator.local_process_index}] VLM loaded", flush=True)
         mem.cleanup()
         mem.log("After VLM load")
         accelerator.wait_for_everyone()
 
         # --- Verifier ---
-        print(f"📦 [Rank {accelerator.local_process_index}] Loading Verifier...", flush=True)
-        verifier = VerifierModel(model_name=verifier_path, device=device)
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading Verifier from {ver_load_path}...", flush=True)
+        verifier = VerifierModel(model_name=ver_load_path, device=device,
+                                  tokenizer_name=verifier_path if resume_dir else None)
         print(f"  ✓ [Rank {accelerator.local_process_index}] Verifier loaded", flush=True)
         mem.cleanup()
         mem.log("After Verifier load")
@@ -265,11 +421,6 @@ def train():
     if len(dataset) == 0:
         print(f"🛑 ERROR: No images found in {args.data_dir}", flush=True)
         sys.exit(1)
-    # 高性能数据加载设置 (1.5TB RAM优化)
-    num_workers = min(8, os.cpu_count() // 2)  # 根据CPU核心数动态设置
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
-                           num_workers=num_workers, pin_memory=True, prefetch_factor=2)
-    print(f"[DEBUG] Dataloader created, batch size: {args.batch_size}", flush=True)
 
     # ============================================================
     # 交错 DDP 包装：避免两个模型同时在 GPU 时 Reducer 分配 OOM
@@ -284,7 +435,7 @@ def train():
     mem.log("Before VLM DDP (Verifier on CPU)")
 
     v_opt = torch.optim.AdamW(vlm.model.parameters(), lr=1e-6)
-    vlm.model, v_opt, dataloader = accelerator.prepare(vlm.model, v_opt, dataloader)
+    vlm.model, v_opt = accelerator.prepare(vlm.model, v_opt)
     mem.log("After VLM DDP")
 
     # Step 2: VLM 内部 → CPU，为 Verifier DDP 初始化腾显存
@@ -304,16 +455,77 @@ def train():
     mem.cleanup()
     mem.log("Both models DDP-wrapped and on GPU")
 
-    GROUP_SIZE = 8
+    # ============================================================
+    # 资源自适应调优：DDP 包装完成后测量实际可用显存
+    # ============================================================
+    tuner = ResourceAutoTuner(device, accelerator, mem)
+    batch_size, GROUP_SIZE, num_gen_default, num_workers = tuner.recommend(
+        vlm.model, verifier.model,
+        user_batch_size=args.batch_size,
+        user_group_size=args.group_size,
+        user_num_gen=args.num_generations,
+    )
+
+    # OOM 连续计数器，用于跨 epoch 动态降级
+    oom_counter = 0
+    OOM_DEGRADE_THRESHOLD = 3
+
+    # 延迟创建 DataLoader（依赖 auto-tune 的 batch_size）
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
+                           num_workers=num_workers, pin_memory=True, prefetch_factor=2)
+    dataloader = accelerator.prepare(dataloader)
+    print(f"[DEBUG] Dataloader created, batch_size={batch_size}, group_size={GROUP_SIZE}, "
+          f"num_gen={num_gen_default}, num_workers={num_workers}", flush=True)
+
+    # ============================================================
+    # 断点续传：恢复 optimizer 状态和 RNG
+    # ============================================================
+    start_epoch = 0
+    global_step = 0
+    if resume_dir:
+        state_file = os.path.join(resume_dir, "training_state.pt")
+        if os.path.isfile(state_file):
+            if accelerator.is_main_process:
+                print(f"[RESUME] 正在加载训练状态: {state_file}", flush=True)
+            ckpt_state = torch.load(state_file, map_location="cpu", weights_only=False)
+            start_epoch = ckpt_state["epoch"] + 1
+            global_step = ckpt_state["global_step"]
+            try:
+                v_opt.load_state_dict(ckpt_state["v_opt_state"])
+                ver_opt.load_state_dict(ckpt_state["ver_opt_state"])
+                if accelerator.is_main_process:
+                    print(f"[RESUME] Optimizer 状态已恢复", flush=True)
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"[RESUME] 警告: Optimizer 状态加载失败 ({e})，使用新 optimizer", flush=True)
+            # 恢复 RNG 状态
+            if "rng_state" in ckpt_state:
+                torch.set_rng_state(ckpt_state["rng_state"])
+            if "cuda_rng_state" in ckpt_state and torch.cuda.is_available():
+                torch.cuda.set_rng_state(ckpt_state["cuda_rng_state"])
+            if "np_rng_state" in ckpt_state:
+                np.random.set_state(ckpt_state["np_rng_state"])
+            del ckpt_state
+            mem.cleanup()
+            if accelerator.is_main_process:
+                print(f"[RESUME] 从 epoch {start_epoch}, global_step {global_step} 继续训练", flush=True)
 
     # 5. 完整训练循环
     if accelerator.is_main_process:
         print(f"[INFO] Starting training loop, total batches: {len(dataloader)}", flush=True)
     accelerator.wait_for_everyone()
     print(f"[DEBUG-Rank{accelerator.local_process_index}] All ranks synchronized, starting epoch loop", flush=True)
-    for epoch in range(5):
+    num_epochs = 5
+    total_batches = len(dataloader)
+    total_steps = num_epochs * total_batches  # 总 step 数
+    # 如果是 resume，global_step 已从 checkpoint 恢复，不重置
+    training_start_time = time.time()
+
+    for epoch in range(start_epoch, num_epochs):
+        epoch_start_time = time.time()
         pbar = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}")
         for batch_idx, (images, image_paths) in enumerate(pbar):
+            global_step += 1
 
             # ============================================================
             # PHASE 1: VLM 生成（Verifier 换出到 CPU 腾显存）
@@ -327,8 +539,7 @@ def train():
 
             with torch.no_grad():
                 for idx, (img, path) in enumerate(zip(images, image_paths)):
-                    # OOM 安全生成：先尝试 10 个，OOM 则降到 5 个
-                    num_gen = 10
+                    num_gen = num_gen_default
                     def _generate():
                         return vlm.generate_description_batch([img], num_generations=num_gen)[0]
 
@@ -336,9 +547,15 @@ def train():
                         raw, _ = mem.safe_execute(_generate, retries=1)
                     except torch.cuda.OutOfMemoryError:
                         # 降级：减少生成数量
-                        num_gen = 5
-                        print(f"[MEM-R{mem.rank}] ⚠️ 降级生成数: {num_gen}", flush=True)
-                        raw, _ = mem.safe_execute(_generate, retries=1)
+                        num_gen = max(GROUP_SIZE, num_gen // 2)
+                        print(f"[MEM-R{mem.rank}] ⚠️ Phase1 OOM, 降级生成数: {num_gen}", flush=True)
+                        oom_counter += 1
+                        try:
+                            raw, _ = mem.safe_execute(_generate, retries=1)
+                        except torch.cuda.OutOfMemoryError:
+                            print(f"[MEM-R{mem.rank}] ⚠️ Phase1 再次 OOM, 跳过图片 {idx}", flush=True)
+                            oom_counter += 1
+                            continue
 
                     diverse = select_diverse_descriptions(raw, similarity_model, GROUP_SIZE)
                     flat_desc.extend(diverse)
@@ -536,11 +753,36 @@ def train():
             ver_rew_display = global_ver_rew_t.mean().item()
             if accelerator.is_main_process and batch_idx % 5 == 0:
                 free_mib = mem.get_free_mib()
+
+                # 计算训练进度和预估剩余时间
+                elapsed = time.time() - training_start_time
+                avg_step_time = elapsed / global_step
+                remaining_steps = total_steps - global_step
+                eta_seconds = avg_step_time * remaining_steps
+                # 格式化剩余时间
+                eta_h = int(eta_seconds // 3600)
+                eta_m = int((eta_seconds % 3600) // 60)
+                eta_s = int(eta_seconds % 60)
+                progress_pct = global_step / total_steps * 100
+
                 pbar.set_postfix({
                     "V_Rew": f"{v_rew_t.mean().item():.2f}",
                     "Ver_Rew": f"{ver_rew_display:.2f}",
-                    "Free": f"{free_mib:.0f}M"
+                    "Free": f"{free_mib:.0f}M",
+                    "Step": f"{global_step}/{total_steps}",
+                    "ETA": f"{eta_h}h{eta_m:02d}m{eta_s:02d}s",
                 })
+
+                # 每 20 个 batch 输出一次详细进度日志（tqdm 进度条可能被其他日志冲掉）
+                if batch_idx % 20 == 0:
+                    epoch_elapsed = time.time() - epoch_start_time
+                    print(f"[PROGRESS] Epoch {epoch} Batch {batch_idx}/{total_batches} | "
+                          f"Global {global_step}/{total_steps} ({progress_pct:.1f}%) | "
+                          f"Avg {avg_step_time:.1f}s/step | "
+                          f"Epoch elapsed {epoch_elapsed/60:.1f}min | "
+                          f"ETA {eta_h}h{eta_m:02d}m{eta_s:02d}s | "
+                          f"V_Rew={v_rew_t.mean().item():.2f} Ver_Rew={ver_rew_display:.2f}",
+                          flush=True)
 
         # Save Checkpoint — 两个模型都要在 GPU 上才能 save
         v_opt.zero_grad()
@@ -550,8 +792,71 @@ def train():
         if accelerator.is_main_process:
             save_p = os.path.join(checkpoint_dir, f"epoch_{epoch}")
             os.makedirs(save_p, exist_ok=True)
+            # 保存模型权重 (HF format)
             accelerator.unwrap_model(vlm.model).save_pretrained(os.path.join(save_p, "vlm"))
             accelerator.unwrap_model(verifier.model).save_pretrained(os.path.join(save_p, "verifier"))
-            print(f"[CKPT] Epoch {epoch} saved to {save_p}", flush=True)
+            # 保存训练状态 (optimizer + RNG + 进度)
+            training_state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "v_opt_state": v_opt.state_dict(),
+                "ver_opt_state": ver_opt.state_dict(),
+                "rng_state": torch.get_rng_state(),
+                "np_rng_state": np.random.get_state(),
+            }
+            if torch.cuda.is_available():
+                training_state["cuda_rng_state"] = torch.cuda.get_rng_state()
+            torch.save(training_state, os.path.join(save_p, "training_state.pt"))
+            # 更新 latest 符号链接
+            latest_link = os.path.join(checkpoint_dir, "latest")
+            if os.path.islink(latest_link) or os.path.exists(latest_link):
+                os.remove(latest_link)
+            os.symlink(os.path.abspath(save_p), latest_link)
+            print(f"[CKPT] Epoch {epoch} saved to {save_p} (latest → {save_p})", flush=True)
+
+        # Epoch 结束汇总
+        if accelerator.is_main_process:
+            epoch_time = time.time() - epoch_start_time
+            total_elapsed = time.time() - training_start_time
+            remaining_epochs = num_epochs - (epoch + 1)
+            avg_epoch_time = total_elapsed / (epoch + 1)
+            eta_epochs = avg_epoch_time * remaining_epochs
+            eta_h = int(eta_epochs // 3600)
+            eta_m = int((eta_epochs % 3600) // 60)
+            print(f"[EPOCH] Epoch {epoch} done in {epoch_time/60:.1f}min | "
+                  f"Total elapsed {total_elapsed/60:.1f}min | "
+                  f"Remaining {remaining_epochs} epochs, ETA ~{eta_h}h{eta_m:02d}m",
+                  flush=True)
+
+        # --- 跨 epoch OOM 动态降级 ---
+        if oom_counter >= OOM_DEGRADE_THRESHOLD:
+            old_bs, old_gs, old_ng = batch_size, GROUP_SIZE, num_gen_default
+            # 降一档：找到当前 tier 的下一级
+            downgraded = False
+            for i, (_, t_bs, t_gs, t_ng) in enumerate(ResourceAutoTuner.TIERS):
+                if t_bs == batch_size and t_gs == GROUP_SIZE:
+                    if i + 1 < len(ResourceAutoTuner.TIERS):
+                        _, batch_size, GROUP_SIZE, num_gen_default = ResourceAutoTuner.TIERS[i + 1]
+                        downgraded = True
+                    break
+            if not downgraded and batch_size > 2:
+                # 当前不在标准 tier 上，手动减半
+                GROUP_SIZE = max(2, GROUP_SIZE // 2)
+                num_gen_default = max(GROUP_SIZE, num_gen_default // 2)
+                batch_size = max(GROUP_SIZE, (batch_size // 2 // GROUP_SIZE) * GROUP_SIZE)
+            if batch_size != old_bs or GROUP_SIZE != old_gs:
+                # 重建 DataLoader
+                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                                       collate_fn=collate_fn, num_workers=num_workers,
+                                       pin_memory=True, prefetch_factor=2)
+                dataloader = accelerator.prepare(dataloader)
+                total_batches = len(dataloader)
+                total_steps = num_epochs * total_batches
+                if accelerator.is_main_process:
+                    print(f"[AUTO-TUNE] OOM count={oom_counter} >= {OOM_DEGRADE_THRESHOLD}, "
+                          f"降级: batch_size {old_bs}->{batch_size}, "
+                          f"group_size {old_gs}->{GROUP_SIZE}, "
+                          f"num_gen {old_ng}->{num_gen_default}", flush=True)
+            oom_counter = 0  # 重置计数器
 
 if __name__ == "__main__": train()
