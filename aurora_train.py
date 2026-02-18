@@ -584,6 +584,7 @@ def train():
             # ============================================================
             phase_t0 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
+            vlm.disable_gradient_checkpointing()
             if not no_swap:
                 mem.offload(verifier.model, "Verifier")
 
@@ -642,6 +643,7 @@ def train():
                 print(f"[TIMER] Phase1 (VLM gen): {time.time()-phase_t0:.1f}s", flush=True)
             phase_t1 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
+            verifier.disable_gradient_checkpointing()
             if not no_swap:
                 mem.offload(vlm.model, "VLM")
                 mem.reload(verifier.model, "Verifier")
@@ -690,7 +692,8 @@ def train():
                     claims_by_image.append((path, all_claims_for_img))
 
             try:
-                batch_verdicts = tools.verify_claims_batch(claims_by_image)
+                preloaded_images = dict(zip(image_paths, images))
+                batch_verdicts = tools.verify_claims_batch(claims_by_image, preloaded_images=preloaded_images)
             except Exception as e:
                 print(f"[WARN-R{mem.rank}] Batch tool verify failed: {e}, falling back to per-claim", flush=True)
                 batch_verdicts = {}
@@ -724,6 +727,7 @@ def train():
                 mem.reload(vlm.model, "VLM")
                 mem.offload(verifier.model, "Verifier")
                 mem.reload_optimizer(v_opt, "VLM-Opt")
+            vlm.enable_gradient_checkpointing()
             accelerator.unwrap_model(vlm.model).train()
             print(f"[MODE-R{mem.rank}] VLM → .train()", flush=True)
 
@@ -771,7 +775,7 @@ def train():
                     for k in range(len(group_desc)):
                         text = group_desc[k]
                         img = group_images[k]
-                        msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+                        msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe this image in detail."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
                         text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
                         inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
                         group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
@@ -811,6 +815,7 @@ def train():
                 mem.offload(vlm.model, "VLM")
                 mem.reload(verifier.model, "Verifier")
                 mem.reload_optimizer(ver_opt, "Ver-Opt")
+            verifier.enable_gradient_checkpointing()
             accelerator.unwrap_model(verifier.model).train()
             print(f"[MODE-R{mem.rank}] Verifier → .train()", flush=True)
 

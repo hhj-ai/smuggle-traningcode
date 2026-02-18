@@ -41,7 +41,7 @@ export OMP_NUM_THREADS=1
 
 # ============================================================
 # 4. 自动检测 GPU 显存，筛选训练卡
-#    工具模型分配由 Python 运行时自动按显存决定
+#    工具模型随训练进程加载到各自 GPU，无需额外分配
 # ============================================================
 TRAIN_THRESHOLD_MIB=80000   # 训练卡至少需要 80 GiB 空闲
 TOOL_THRESHOLD_MIB=4000     # 工具卡至少需要 4 GiB 空闲 (DINO+CLIP ~1.5GB)
@@ -77,14 +77,10 @@ fi
 echo ""
 echo "✅ 可用训练 GPU: [${TRAIN_GPUS[*]}] (共 ${NUM_TRAIN} 张)"
 
-# 将训练卡 + 有余量的额外卡都放入 CUDA_VISIBLE_DEVICES，
-# 工具模型由 Python 运行时自动查询各卡空闲显存并分散加载
-ALL_VISIBLE=("${TRAIN_GPUS[@]}" "${EXTRA_GPUS[@]}")
+# 工具模型随各 rank 加载到对应训练卡，不再需要额外卡
+ALL_VISIBLE=("${TRAIN_GPUS[@]}")
 CUDA_VIS=$(IFS=,; echo "${ALL_VISIBLE[*]}")
-if [ ${#EXTRA_GPUS[@]} -gt 0 ]; then
-    echo "🔧 额外可见 GPU (供工具自动分配): [${EXTRA_GPUS[*]}]"
-fi
-echo "🔧 工具模型将由 Python 运行时自动按显存分散到最空闲的卡"
+echo "🔧 工具模型将随各训练进程加载到对应 GPU（8 卡并行验证）"
 
 export CUDA_VISIBLE_DEVICES=$CUDA_VIS
 echo "📋 CUDA_VISIBLE_DEVICES=$CUDA_VIS"

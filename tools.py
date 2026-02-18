@@ -183,40 +183,46 @@ class ToolVerifier:
         except:
             return [0.0] * len(claims)
 
-    def verify_claims_batch(self, claims_by_image):
+    def verify_claims_batch(self, claims_by_image, preloaded_images=None):
         """
         批量验证 claims，按图片分组，每张图只加载一次。
         claims_by_image: [(image_path, [claim1, claim2, ...]), ...]
+        preloaded_images: 可选 dict {image_path: PIL.Image}，避免重复磁盘 IO
         返回: {(image_path, claim): verdict}
         """
         results = {}
-        for img_path, claims in claims_by_image:
-            if not claims:
-                continue
-            if not os.path.exists(img_path):
-                for c in claims:
-                    results[(img_path, c)] = "uncertain"
-                continue
-            try:
-                image = Image.open(img_path).convert("RGB")
-            except:
-                for c in claims:
-                    results[(img_path, c)] = "uncertain"
-                continue
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for img_path, claims in claims_by_image:
+                if not claims:
+                    continue
+                # 尝试使用预加载图片
+                image = None
+                if preloaded_images and img_path in preloaded_images:
+                    image = preloaded_images[img_path]
+                else:
+                    if not os.path.exists(img_path):
+                        for c in claims:
+                            results[(img_path, c)] = "uncertain"
+                        continue
+                    try:
+                        image = Image.open(img_path).convert("RGB")
+                    except:
+                        for c in claims:
+                            results[(img_path, c)] = "uncertain"
+                        continue
 
-            # 并行执行 DINO 和 CLIP（它们在不同设备上）
-            with ThreadPoolExecutor(max_workers=2) as executor:
+                # 并行执行 DINO 和 CLIP（它们在不同设备上）
                 dino_future = executor.submit(self._batch_verify_dino, claims, image)
                 clip_future = executor.submit(self._batch_verify_clip, claims, image)
                 dino_scores = dino_future.result()
                 clip_scores = clip_future.result()
 
-            for i, c in enumerate(claims):
-                score = max(dino_scores[i], clip_scores[i])
-                if score <= 0.0:
-                    results[(img_path, c)] = "uncertain"
-                elif score > 0.5:
-                    results[(img_path, c)] = "correct"
-                else:
-                    results[(img_path, c)] = "incorrect"
+                for i, c in enumerate(claims):
+                    score = max(dino_scores[i], clip_scores[i])
+                    if score <= 0.0:
+                        results[(img_path, c)] = "uncertain"
+                    elif score > 0.5:
+                        results[(img_path, c)] = "correct"
+                    else:
+                        results[(img_path, c)] = "incorrect"
         return results

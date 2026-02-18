@@ -57,6 +57,16 @@ class VerifierModel:
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
 
+    def enable_gradient_checkpointing(self):
+        model = _unwrap_model(self.model)
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+
+    def disable_gradient_checkpointing(self):
+        model = _unwrap_model(self.model)
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
     def verify_claims(self, description):
         prompt = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {description}\n\nClaims:"
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -123,7 +133,7 @@ class VerifierModel:
             # tokenize full texts with padding
             full_enc = self.tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
             # get per-sample prompt lengths (without padding)
-            prompt_lens = [self.tokenizer(pt, return_tensors="pt").input_ids.shape[1] for pt in prompt_texts]
+            prompt_lens = [len(self.tokenizer(pt).input_ids) for pt in prompt_texts]
             # build labels: mask prompt + padding with -100
             labels = full_enc.input_ids.clone()
             for j in range(len(batch_prompts)):
@@ -184,6 +194,16 @@ class VLMModel:
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
 
+    def enable_gradient_checkpointing(self):
+        model = _unwrap_model(self.model)
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+
+    def disable_gradient_checkpointing(self):
+        model = _unwrap_model(self.model)
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
     def generate_description_batch(self, image_inputs, num_generations=4):
         print(f"[DEBUG-VLM] Starting generate_description_batch for {len(image_inputs)} images, {num_generations} generations", flush=True)
         messages_batch = []
@@ -223,7 +243,7 @@ class VLMModel:
             msgs_list = []
             for img, txt in zip(batch_imgs, batch_txts):
                 msg = [
-                    {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe."}]},
+                    {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe this image in detail."}]},
                     {"role": "assistant", "content": [{"type": "text", "text": txt}]}
                 ]
                 msgs_list.append(msg)
@@ -232,6 +252,18 @@ class VLMModel:
             labels = inputs.input_ids.clone()
             # mask padding
             labels[inputs.attention_mask == 0] = -100
+            # mask prompt tokens (only train on completion)
+            prompt_only_msgs = []
+            for img in batch_imgs:
+                msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe this image in detail."}]}]
+                prompt_only_msgs.append(msg)
+            prompt_only_texts = [self.processor.apply_chat_template(m, add_generation_prompt=True) for m in prompt_only_msgs]
+            prompt_only_enc = self.processor(text=prompt_only_texts, images=batch_imgs, padding=True, return_tensors="pt")
+            for j in range(len(batch_imgs)):
+                prompt_len = prompt_only_enc.attention_mask[j].sum().item()
+                pad_count = (inputs.attention_mask[j] == 0).sum().item()
+                labels[j, pad_count:pad_count + prompt_len] = -100
+            del prompt_only_enc
             # forward — 需要传入 pixel_values / image_grid_thw 等视觉输入
             forward_kwargs = {k: v for k, v in inputs.items()}
             forward_kwargs["labels"] = labels
