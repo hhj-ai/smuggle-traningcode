@@ -154,7 +154,19 @@ class ResourceAutoTuner:
         self.mem.reload(vlm_model, "VLM (auto-tune both)")
         self.mem.cleanup()
         free_both = self._get_free_gb()
-        no_swap = free_both >= 10.0  # 10GB 余量够 KV-cache + 梯度
+
+        # 估算 AdamW 优化器状态内存：每个参数需要 2 个 fp32 缓冲区 (momentum + variance)
+        vlm_numel = sum(p.numel() for p in self.accelerator.unwrap_model(vlm_model).parameters())
+        ver_numel = sum(p.numel() for p in self.accelerator.unwrap_model(verifier_model).parameters())
+        opt_state_gb = (vlm_numel + ver_numel) * 8 / (1024 ** 3)  # 2 × fp32 per param
+        grad_gb = max(vlm_numel, ver_numel) * 2 / (1024 ** 3)     # bf16 梯度
+        no_swap_needed = opt_state_gb + grad_gb + 10.0  # 10GB 余量给激活值
+        no_swap = free_both >= no_swap_needed
+
+        if self.accelerator.is_main_process:
+            print(f"[AUTO-TUNE] no_swap check: free_both={free_both:.1f}GB, "
+                  f"opt_states={opt_state_gb:.1f}GB, grads={grad_gb:.1f}GB, "
+                  f"needed={no_swap_needed:.1f}GB → no_swap={no_swap}", flush=True)
 
         # 恢复初始状态：VLM on GPU, Verifier on CPU (Phase 1 起始状态)
         self.mem.offload(verifier_model, "Verifier (auto-tune restore)")
@@ -766,7 +778,12 @@ def train():
                     v_opt.zero_grad()
                     break
 
-            v_opt.step()
+            torch.cuda.empty_cache()
+            try:
+                v_opt.step()
+            except torch.cuda.OutOfMemoryError:
+                print(f"[MEM-R{mem.rank}] ❌ VLM optimizer step OOM, skipping", flush=True)
+                oom_counter += 1
             v_opt.zero_grad()
             if not no_swap:
                 mem.cleanup()
@@ -831,7 +848,12 @@ def train():
                     ver_opt.zero_grad()
                     break
 
-            ver_opt.step()
+            torch.cuda.empty_cache()
+            try:
+                ver_opt.step()
+            except torch.cuda.OutOfMemoryError:
+                print(f"[MEM-R{mem.rank}] ❌ Verifier optimizer step OOM, skipping", flush=True)
+                oom_counter += 1
             ver_opt.zero_grad()
             if not no_swap:
                 mem.cleanup()
