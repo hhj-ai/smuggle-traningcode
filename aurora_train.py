@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 import os, time, gc, argparse, sys
 from PIL import Image
@@ -99,22 +100,42 @@ def train():
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"🚀 AURORA: 8x H200 (14GB RAM Mode)")
 
-    # 3. 并行加载（避免死锁）
+    # 3. 顺序加载 + 同步屏障（减少峰值内存与IO争抢）
     vlm, verifier, tools, similarity_model = None, None, None, None
     try:
-        print(f"📦 [Rank {accelerator.local_process_index}] Loading models in parallel...", flush=True)
+        # --- VLM (最大模型，优先加载) ---
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading VLM...", flush=True)
         vlm = VLMModel(model_name=vlm_path, device=device)
-        print(f"  ✓ VLM loaded", flush=True)
-        verifier = VerifierModel(model_name=verifier_path, device=device)
-        print(f"  ✓ Verifier loaded", flush=True)
-        tools = ToolVerifier(device=device, model_root=args.model_dir)
-        print(f"  ✓ Tools loaded", flush=True)
-        similarity_model = SentenceTransformer(args.minilm_path, device=device)
-        print(f"  ✓ SentenceTransformer loaded", flush=True)
+        print(f"  ✓ [Rank {accelerator.local_process_index}] VLM loaded", flush=True)
         gc.collect(); torch.cuda.empty_cache()
-        print(f"  ✓ Memory cleaned", flush=True)
+        accelerator.wait_for_everyone()
+
+        # --- Verifier ---
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading Verifier...", flush=True)
+        verifier = VerifierModel(model_name=verifier_path, device=device)
+        print(f"  ✓ [Rank {accelerator.local_process_index}] Verifier loaded", flush=True)
+        gc.collect(); torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+
+        # --- Tools: 仅主进程加载，节省非主进程 GPU 显存 ---
+        if accelerator.is_main_process:
+            print(f"📦 [Rank {accelerator.local_process_index}] Loading Tools...", flush=True)
+            tools = ToolVerifier(device=device, model_root=args.model_dir)
+            print(f"  ✓ Tools loaded (rank 0 only)", flush=True)
+        else:
+            tools = None
+            print(f"⏭️  [Rank {accelerator.local_process_index}] Skipping tools (rank 0 only)", flush=True)
+        gc.collect(); torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+
+        # --- SentenceTransformer (小模型) ---
+        print(f"📦 [Rank {accelerator.local_process_index}] Loading SentenceTransformer...", flush=True)
+        similarity_model = SentenceTransformer(args.minilm_path, device=device)
+        print(f"  ✓ [Rank {accelerator.local_process_index}] SentenceTransformer loaded", flush=True)
+        gc.collect(); torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
     except Exception as e:
-        print(f"🛑 INIT FAILED: {e}", flush=True)
+        print(f"🛑 INIT FAILED on rank {accelerator.local_process_index}: {e}", flush=True)
         sys.exit(1)
 
     accelerator.wait_for_everyone()
@@ -167,24 +188,42 @@ def train():
                     flat_paths.extend([path] * len(diverse))
                 print(f"[DEBUG-Rank{accelerator.local_process_index}] VLM generation complete, total descriptions: {len(flat_desc)}", flush=True)
             
-            # === PHASE 2: Verifier 提取与验证 ===
-            ver_results = []
-            ver_raw_resp = [] 
+            # === PHASE 2: Verifier 提取（所有rank）+ 工具验证（仅rank 0）===
+            ver_raw_resp = []
             ver_corr_scores = []
+            local_claims_list = []  # 每个描述的claims
 
             with torch.no_grad():
                 for i, desc in enumerate(flat_desc):
-                    claims, raw = verifier.verify_claims(desc) # Prompt 逻辑在内部封装
+                    claims, raw = verifier.verify_claims(desc)
                     ver_raw_resp.append(raw)
                     ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
-                    
-                    res_per_desc = []
-                    for c in claims:
-                        v, _, _ = tools.verify_claim(c, flat_paths[i])
-                        # 简单词袋溯源
-                        t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
-                        res_per_desc.append({'verdict': v, 'traceable': t})
-                    ver_results.append(res_per_desc)
+                    local_claims_list.append((claims, flat_paths[i], desc))
+
+            # Gather claims到rank 0进行工具验证
+            gathered_claims = [None] * accelerator.num_processes if accelerator.is_main_process else None
+            dist.gather_object(local_claims_list, gathered_claims, dst=0)
+
+            # Rank 0执行工具验证
+            if accelerator.is_main_process:
+                all_results_by_rank = []
+                for rank_claims in gathered_claims:
+                    rank_results = []
+                    for claims, path, desc in rank_claims:
+                        res_per_desc = []
+                        for c in claims:
+                            v, _, _ = tools.verify_claim(c, path)
+                            t = (len(set(c.lower().split()) & set(desc.lower().split())) / (len(c.split())+1e-6) > 0.7)
+                            res_per_desc.append({'verdict': v, 'traceable': t})
+                        rank_results.append(res_per_desc)
+                    all_results_by_rank.append(rank_results)
+            else:
+                all_results_by_rank = None
+
+            # Scatter验证结果回各rank
+            local_results = [None]
+            dist.scatter_object_list(local_results, all_results_by_rank, src=0)
+            ver_results = local_results[0]
 
             # === PHASE 3: VLM 训练 ===
             print(f"[DEBUG-Rank{accelerator.local_process_index}] Calculating VLM rewards for {len(flat_desc)} descriptions", flush=True)
