@@ -74,6 +74,31 @@ class GPUMemoryManager:
         free = self.get_free_mib()
         print(f"[MEM-R{self.rank}] ↑ {name} → GPU (GPU free: {free:.0f}MiB)", flush=True)
 
+    # --- 优化器状态换出到 CPU ---
+    def offload_optimizer(self, optimizer, name="optimizer"):
+        """将优化器状态移到 CPU"""
+        moved = 0
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+                    state[k] = v.cpu()
+                    moved += 1
+        if moved > 0:
+            self.cleanup()
+            print(f"[MEM-R{self.rank}] ↓ {name} states → CPU ({moved} tensors)", flush=True)
+
+    # --- 优化器状态换入到 GPU ---
+    def reload_optimizer(self, optimizer, name="optimizer"):
+        """将优化器状态移回 GPU"""
+        moved = 0
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                    state[k] = v.to(self.device)
+                    moved += 1
+        if moved > 0:
+            print(f"[MEM-R{self.rank}] ↑ {name} states → GPU ({moved} tensors)", flush=True)
+
     # --- OOM 安全执行 ---
     def safe_execute(self, fn, retries=2, cleanup_before_retry=True):
         """
@@ -714,8 +739,10 @@ def train():
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase3-start")
             if not no_swap:
+                mem.offload_optimizer(ver_opt, "Ver-Opt")
                 mem.reload(vlm.model, "VLM")
                 mem.offload(verifier.model, "Verifier")
+                mem.reload_optimizer(v_opt, "VLM-Opt")
             accelerator.unwrap_model(vlm.model).train()
             print(f"[MODE-R{mem.rank}] VLM → .train()", flush=True)
 
@@ -796,8 +823,10 @@ def train():
             # ============================================================
             mem.log(f"E{epoch}B{batch_idx} Phase4-start")
             if not no_swap:
+                mem.offload_optimizer(v_opt, "VLM-Opt")
                 mem.offload(vlm.model, "VLM")
                 mem.reload(verifier.model, "Verifier")
+                mem.reload_optimizer(ver_opt, "Ver-Opt")
             accelerator.unwrap_model(verifier.model).train()
             print(f"[MODE-R{mem.rank}] Verifier → .train()", flush=True)
 
@@ -863,7 +892,10 @@ def train():
 
             # --- batch 结束 ---
             if not no_swap:
+                mem.offload_optimizer(ver_opt, "Ver-Opt")
+                mem.offload(verifier.model, "Verifier")
                 mem.reload(vlm.model, "VLM")
+                # Phase 1 是 no_grad 推理，不需要 VLM 优化器状态在 GPU
 
             ver_rew_display = global_ver_rew_t.mean().item()
             if accelerator.is_main_process:
