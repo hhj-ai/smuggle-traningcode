@@ -87,9 +87,20 @@ if [ ${#TOOL_GPU_CANDIDATES[@]} -gt 0 ]; then
     TOOL_DEVICE_ARG="--tool_device cuda:${NUM_TRAIN}"
     echo "🔧 工具专用 GPU: 物理 GPU $TOOL_PHYS_GPU → 逻辑 cuda:${NUM_TRAIN}"
 else
-    # 没有专用工具卡，工具在 rank 0 的训练卡上加载
+    # 没有专用工具卡，选训练卡中显存最空闲的那张
     CUDA_VIS=$(IFS=,; echo "${TRAIN_GPUS[*]}")
-    echo "🔧 无专用工具卡，工具将加载在 rank 0 的训练 GPU 上"
+    BEST_FREE=0
+    BEST_IDX=0
+    for i in "${!TRAIN_GPUS[@]}"; do
+        gid=${TRAIN_GPUS[$i]}
+        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gid" 2>/dev/null | tr -d ' ')
+        if [ "$free_mib" -gt "$BEST_FREE" ]; then
+            BEST_FREE=$free_mib
+            BEST_IDX=$i
+        fi
+    done
+    TOOL_DEVICE_ARG="--tool_device cuda:${BEST_IDX}"
+    echo "🔧 无专用工具卡，选最空闲训练 GPU: 物理 GPU ${TRAIN_GPUS[$BEST_IDX]} (${BEST_FREE} MiB free) → 逻辑 cuda:${BEST_IDX}"
 fi
 
 export CUDA_VISIBLE_DEVICES=$CUDA_VIS
