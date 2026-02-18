@@ -232,8 +232,10 @@ class VLMModel:
             labels = inputs.input_ids.clone()
             # mask padding
             labels[inputs.attention_mask == 0] = -100
-            # forward
-            outputs = model_to_use(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, labels=labels)
+            # forward — 需要传入 pixel_values / image_grid_thw 等视觉输入
+            forward_kwargs = {k: v for k, v in inputs.items()}
+            forward_kwargs["labels"] = labels
+            outputs = model_to_use(**forward_kwargs)
             # per-sample log-prob
             logits = outputs.logits[:, :-1, :]
             shift_labels = labels[:, 1:]
