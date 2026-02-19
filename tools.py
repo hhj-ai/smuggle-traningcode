@@ -97,19 +97,17 @@ class ToolVerifier:
             print(f"   - OCR Ready (GPU: {use_gpu}) ✅")
         except: self.ocr_reader = None
 
-        # 3. CLIP (权重文件为 .bin 格式，需要绕过 PyTorch >= 2.6 的 torch.load 安全限制)
+        # 3. CLIP (权重文件为 .bin 格式，需要绕过 PyTorch 的 torch.load 安全限制)
         try:
-            _old_env = os.environ.get("TORCH_FORCE_WEIGHTS_ONLY_LOAD")
-            os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
+            _orig_load = torch.load
+            torch.load = lambda *args, **kwargs: _orig_load(*args, **{k: v for k, v in kwargs.items() if k != 'weights_only'}, weights_only=False)
             self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(self.clip_device)
             self.clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
-            if _old_env is None:
-                os.environ.pop("TORCH_FORCE_WEIGHTS_ONLY_LOAD", None)
-            else:
-                os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = _old_env
+            torch.load = _orig_load
             self.clip_model.eval()
             print("   - CLIP Ready ✅")
         except Exception as e:
+            torch.load = _orig_load
             print(f"⚠️ CLIP missing or error: {e}")
             self.clip_model = None
 
