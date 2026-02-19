@@ -54,18 +54,17 @@ class VerifierModel:
         )
         self.model.eval()
 
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
     def enable_gradient_checkpointing(self):
         model = _unwrap_model(self.model)
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
+            model.config.use_cache = False
 
     def disable_gradient_checkpointing(self):
         model = _unwrap_model(self.model)
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
+            model.config.use_cache = True
 
     def verify_claims(self, description):
         prompt = f"Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {description}\n\nClaims:"
@@ -74,7 +73,7 @@ class VerifierModel:
         model_to_gen = _unwrap_model(self.model)
 
         with torch.no_grad():
-            outputs = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.6, pad_token_id=self.tokenizer.pad_token_id)
+            outputs = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.6, pad_token_id=self.tokenizer.pad_token_id, use_cache=True)
         raw = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
         clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         claims = [line.strip().lstrip('-*').strip() for line in clean.split('\n') if len(line.strip()) > 5]
@@ -107,7 +106,8 @@ class VerifierModel:
             with torch.no_grad():
                 outputs = model_to_gen.generate(
                     **inputs, max_new_tokens=256, do_sample=True,
-                    temperature=0.6, pad_token_id=self.tokenizer.pad_token_id
+                    temperature=0.6, pad_token_id=self.tokenizer.pad_token_id,
+                    use_cache=True
                 )
             # 每个样本的 prompt 长度不同（因 padding），用 input_ids 长度截断
             for j in range(len(batch_descs)):
@@ -193,18 +193,17 @@ class VLMModel:
         if self.tokenizer.model_max_length < 4096:
             self.tokenizer.model_max_length = 4096
 
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
     def enable_gradient_checkpointing(self):
         model = _unwrap_model(self.model)
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
+            model.config.use_cache = False
 
     def disable_gradient_checkpointing(self):
         model = _unwrap_model(self.model)
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
+            model.config.use_cache = True
 
     def generate_description_batch(self, image_inputs, num_generations=4, sub_batch_size=None):
         print(f"[DEBUG-VLM] Starting generate_description_batch for {len(image_inputs)} images, "
@@ -236,7 +235,7 @@ class VLMModel:
         model_to_gen = _unwrap_model(self.model)
 
         with torch.no_grad():
-            generated_ids = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=1.0, num_return_sequences=num_generations)
+            generated_ids = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=1.0, num_return_sequences=num_generations, use_cache=True)
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids.repeat_interleave(num_generations, dim=0), generated_ids)]
         texts = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
         return [texts[i * num_generations : (i + 1) * num_generations] for i in range(len(image_inputs))]

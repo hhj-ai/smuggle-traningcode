@@ -16,6 +16,7 @@ from sentence_transformers import SentenceTransformer, util
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
 import warnings
+warnings.filterwarnings("ignore", message=".*torch.cpu.amp.autocast.*", category=FutureWarning)
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
     from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -23,6 +24,8 @@ with warnings.catch_warnings():
 from models import VLMModel, VerifierModel
 from tools import ToolVerifier
 from rewards import RewardCalculator
+from training_logger import TrainingLogger
+from post_eval import run_post_training_eval
 
 
 # ============================================================
@@ -211,19 +214,27 @@ def collate_fn(batch):
 
 def encode_long_texts(model, texts, max_tokens=450):
     """对超长文本按 token 精确分块编码后取平均，避免 MiniLM 512 截断。"""
+    import logging
     tokenizer = model.tokenizer
     all_embs = []
-    for text in texts:
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if len(ids) <= max_tokens:
-            all_embs.append(model.encode(text, convert_to_tensor=True))
-        else:
-            chunks = []
-            for i in range(0, len(ids), max_tokens):
-                chunk_text = tokenizer.decode(ids[i:i+max_tokens], skip_special_tokens=True)
-                chunks.append(chunk_text)
-            chunk_embs = model.encode(chunks, convert_to_tensor=True)
-            all_embs.append(chunk_embs.mean(dim=0))
+    # 抑制 tokenizer 的 "Token indices sequence length is longer than..." 警告
+    _tok_logger = logging.getLogger("transformers.tokenization_utils_base")
+    _prev_level = _tok_logger.level
+    _tok_logger.setLevel(logging.ERROR)
+    try:
+        for text in texts:
+            ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if len(ids) <= max_tokens:
+                all_embs.append(model.encode(text, convert_to_tensor=True))
+            else:
+                chunks = []
+                for i in range(0, len(ids), max_tokens):
+                    chunk_text = tokenizer.decode(ids[i:i+max_tokens], skip_special_tokens=True)
+                    chunks.append(chunk_text)
+                chunk_embs = model.encode(chunks, convert_to_tensor=True)
+                all_embs.append(chunk_embs.mean(dim=0))
+    finally:
+        _tok_logger.setLevel(_prev_level)
     return torch.stack(all_embs)
 
 def select_diverse_descriptions(texts, model, target_count):
@@ -321,6 +332,11 @@ def train():
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"🚀 AURORA Training (DDP + ZeRO-1 Optimizer)")
+
+    # Initialize training logger (main process only)
+    logger = None
+    if accelerator.is_main_process:
+        logger = TrainingLogger(args.output_dir)
 
     # ============================================================
     # 断点续传：解析 resume 路径
@@ -802,6 +818,44 @@ def train():
                     "ETA": f"{eta_h}h{eta_m:02d}m{eta_s:02d}s",
                 })
 
+                # --- Log batch metrics to JSONL ---
+                if logger is not None:
+                    # Claim statistics from ver_results
+                    n_correct = sum(1 for vr in ver_results for r in vr if r['verdict'] == 'correct')
+                    n_incorrect = sum(1 for vr in ver_results for r in vr if r['verdict'] == 'incorrect')
+                    n_uncertain = sum(1 for vr in ver_results for r in vr if r['verdict'] == 'uncertain')
+
+                    # Diversity penalty average across groups
+                    div_penalties = []
+                    for gi in range(len(images)):
+                        s, e = gi * GROUP_SIZE, (gi + 1) * GROUP_SIZE
+                        gtxt = flat_desc[s:e]
+                        if len(gtxt) > 1:
+                            emb = encode_long_texts(similarity_model, gtxt)
+                            cos = util.pytorch_cos_sim(emb, emb)
+                            mask_tri = torch.triu(torch.ones_like(cos), 1).bool()
+                            div_penalties.append(cos[mask_tri].mean().item() if mask_tri.any() else 0.0)
+                    avg_div_penalty = sum(div_penalties) / len(div_penalties) if div_penalties else 0.0
+
+                    logger.log_batch({
+                        "epoch": epoch,
+                        "batch_idx": batch_idx,
+                        "global_step": global_step,
+                        "vlm_reward_mean": v_rew_t.mean().item(),
+                        "verifier_reward_mean": ver_rew_display,
+                        "phase1_time": phase_t1 - phase_t0,
+                        "phase2_time": phase_t2 - phase_t1,
+                        "phase3_time": phase_t3 - phase_t2,
+                        "phase4_time": time.time() - phase_t3,
+                        "free_mib": free_mib,
+                        "claim_correct": n_correct,
+                        "claim_incorrect": n_incorrect,
+                        "claim_uncertain": n_uncertain,
+                        "avg_desc_length": sum(len(d.split()) for d in flat_desc) / max(len(flat_desc), 1),
+                        "diversity_penalty": avg_div_penalty,
+                        "claim_correlation_mean": sum(ver_corr_scores) / max(len(ver_corr_scores), 1),
+                    })
+
                 # 每 20 个 batch 输出一次详细进度日志（tqdm 进度条可能被其他日志冲掉）
                 if batch_idx % 20 == 0:
                     epoch_elapsed = time.time() - epoch_start_time
@@ -858,6 +912,28 @@ def train():
             print(f"[EPOCH] Epoch {epoch} done in {epoch_time/60:.1f}min | "
                   f"Total elapsed {total_elapsed/60:.1f}min | "
                   f"Remaining {remaining_epochs} epochs, ETA ~{eta_h}h{eta_m:02d}m",
+                  flush=True)
+
+    # ============================================================
+    # Post-training evaluation (main process only)
+    # ============================================================
+    if accelerator.is_main_process:
+        try:
+            print("[PostEval] Starting post-training evaluation...", flush=True)
+            unwrapped_vlm = accelerator.unwrap_model(vlm.model)
+            unwrapped_vlm.eval()
+            training_metrics = logger.get_all_metrics() if logger else None
+            run_post_training_eval(
+                vlm=vlm,
+                verifier=verifier,
+                tools=tools,
+                vlm_path=vlm_path,
+                output_dir=args.output_dir,
+                data_dir=args.data_dir,
+                training_metrics=training_metrics,
+            )
+        except Exception as e:
+            print(f"[PostEval] Evaluation failed (training results are safe): {e}",
                   flush=True)
 
 if __name__ == "__main__": train()

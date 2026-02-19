@@ -11,8 +11,8 @@ import sys
 # Configuration
 DEFAULT_TRAINED_PATH = "./output/checkpoints/vlm_final"
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct" # 基座模型 ID
-TEST_IMAGE_DIR = "./data/test_images"
-BENCHMARK_DIR = "./data/benchmarks"
+TEST_IMAGE_DIR = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/smuggle-traningcode/data/test_images"
+BENCHMARK_DIR = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/smuggle-traningcode/data/benchmarks"
 
 # Auto-Download URLs for Benchmarks
 POPE_URL = "https://huggingface.co/datasets/shiyue/POPE/resolve/main/coco_pope_random.json"
@@ -100,7 +100,7 @@ class POPEEvaluator:
             
             # 尝试在 YFCC 目录找找（如果用户把 COCO 图放那里了）
             if not os.path.exists(img_path):
-                 yfcc_path = os.path.join("./data/yfcc100m", img_name)
+                 yfcc_path = os.path.join("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/smuggle-traningcode/data/yfcc100m", img_name)
                  if os.path.exists(yfcc_path):
                      img_path = yfcc_path
                  else:
