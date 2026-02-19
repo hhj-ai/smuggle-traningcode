@@ -95,7 +95,7 @@ class VerifierModel:
         if valid_tokens == 0: return torch.tensor(0.0).to(self.device)
         return -outputs.loss * valid_tokens
 
-    def verify_claims_batch(self, descriptions, max_batch=16):
+    def verify_claims_batch(self, descriptions, max_batch=48):
         """批量提取 claims，内部按 max_batch 分片避免 OOM"""
         all_claims, all_raws = [], []
         model_to_gen = _unwrap_model(self.model)
@@ -120,7 +120,7 @@ class VerifierModel:
                 all_raws.append(raw)
         return all_claims, all_raws
 
-    def compute_sequence_log_prob_batch(self, prompts, completions, max_batch=16):
+    def compute_sequence_log_prob_batch(self, prompts, completions, max_batch=32):
         """批量计算多个 (prompt, completion) 对的 sequence log-prob"""
         prompt_tpl = "Extract distinct, verifiable visual claims from the following description. Format as a bulleted list.\n\nDescription: {}\n\nClaims:"
         model_to_use = _unwrap_model(self.model)
@@ -190,6 +190,8 @@ class VLMModel:
         self.model.eval()
         self.tokenizer = self.processor.tokenizer
         self.tokenizer.padding_side = "left"
+        if self.tokenizer.model_max_length < 4096:
+            self.tokenizer.model_max_length = 4096
 
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()

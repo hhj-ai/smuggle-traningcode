@@ -162,7 +162,7 @@ def select_diverse_descriptions(texts, model, target_count):
 
 def calculate_intra_claim_correlation(claims, model):
     if len(claims) < 2: return 0.0
-    embeddings = model.encode(claims, convert_to_tensor=True)
+    embeddings = encode_long_texts(model, claims)
     cos_sim = util.pytorch_cos_sim(embeddings, embeddings)
     mask = torch.eye(len(claims), device=embeddings.device).bool()
     return cos_sim.masked_fill_(mask, 0.0).sum().item() / (len(claims)*(len(claims)-1) + 1e-6)
@@ -421,6 +421,10 @@ def train():
             phase_t0 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
             vlm.disable_gradient_checkpointing()
+            _vlm_inner = accelerator.unwrap_model(vlm.model)
+            if hasattr(_vlm_inner, 'is_gradient_checkpointing') and _vlm_inner.is_gradient_checkpointing:
+                print(f"[WARN-R{mem.rank}] VLM gradient_checkpointing still ON in Phase1!", flush=True)
+                _vlm_inner.gradient_checkpointing_disable()
 
             flat_desc = []
             flat_images = []
@@ -447,6 +451,11 @@ def train():
             phase_t1 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
             verifier.disable_gradient_checkpointing()
+            # 验证 gradient checkpointing 已关闭（否则 KV cache 失效，生成慢 10x）
+            _ver_inner = accelerator.unwrap_model(verifier.model)
+            if hasattr(_ver_inner, 'is_gradient_checkpointing') and _ver_inner.is_gradient_checkpointing:
+                print(f"[WARN-R{mem.rank}] Verifier gradient_checkpointing still ON in Phase2!", flush=True)
+                _ver_inner.gradient_checkpointing_disable()
 
             ver_raw_resp = []
             ver_corr_scores = []
