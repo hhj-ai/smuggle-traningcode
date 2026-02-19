@@ -117,9 +117,23 @@ class YFCCDataset(Dataset):
 def collate_fn(batch):
     return [item[0] for item in batch], [item[1] for item in batch]
 
+def encode_long_texts(model, texts, chunk_words=200):
+    """对超长文本分块编码后取平均，避免 MiniLM 512 token 截断丢失信息。"""
+    all_embs = []
+    for text in texts:
+        words = text.split()
+        if len(words) <= chunk_words:
+            all_embs.append(model.encode(text, convert_to_tensor=True))
+        else:
+            chunks = [" ".join(words[i:i+chunk_words])
+                      for i in range(0, len(words), chunk_words)]
+            chunk_embs = model.encode(chunks, convert_to_tensor=True)
+            all_embs.append(chunk_embs.mean(dim=0))
+    return torch.stack(all_embs)
+
 def select_diverse_descriptions(texts, model, target_count):
     if len(texts) <= target_count: return texts
-    embeddings = model.encode(texts, convert_to_tensor=True)
+    embeddings = encode_long_texts(model, texts)
     cos_sim = util.pytorch_cos_sim(embeddings, embeddings)  # [n, n]
     n = len(texts)
     selected_indices = list(range(n))
@@ -500,7 +514,7 @@ def train():
 
                 div_penalty = 0.0
                 if len(group_txt) > 1:
-                    emb = similarity_model.encode(group_txt, convert_to_tensor=True)
+                    emb = encode_long_texts(similarity_model, group_txt)
                     cos = util.pytorch_cos_sim(emb, emb)
                     mask = torch.triu(torch.ones_like(cos), 1).bool()
                     div_penalty = cos[mask].mean().item() if mask.any() else 0.0

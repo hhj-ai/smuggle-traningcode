@@ -130,7 +130,7 @@ class ToolVerifier:
     def _verify_clip(self, claim, image):
         if not self.clip_model: return 0.0
         try:
-            inputs = self.clip_processor(text=[f"a photo of {claim}"], images=image, return_tensors="pt", padding=True).to(self.clip_device)
+            inputs = self.clip_processor(text=[f"a photo of {claim}"], images=image, return_tensors="pt", padding=True, truncation=True, max_length=77).to(self.clip_device)
             with torch.no_grad():
                 return self.clip_model(**inputs).logits_per_image.softmax(dim=1)[0][0].item()
         except: return 0.0
@@ -164,7 +164,7 @@ class ToolVerifier:
             return [0.0] * len(claims)
         try:
             texts = [f"a photo of {c}" for c in claims]
-            inputs = self.clip_processor(text=texts, images=image, return_tensors="pt", padding=True).to(self.clip_device)
+            inputs = self.clip_processor(text=texts, images=image, return_tensors="pt", padding=True, truncation=True, max_length=77).to(self.clip_device)
             with torch.no_grad():
                 outputs = self.clip_model(**inputs)
             # logits_per_image: [1, num_claims]
