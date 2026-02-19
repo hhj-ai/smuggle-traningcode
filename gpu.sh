@@ -1,5 +1,7 @@
 #!/bin/bash
 # --- 统一路径定义 ---
+pkill -9 -f aurora_train.py 2>/dev/null
+pkill -9 -f accelerate 2>/dev/null
 CODE_DIR=$(cd "$(dirname "$0")"; pwd)
 RES_DIR=$(realpath "$CODE_DIR/../aurora_resources")
 MODELS_DIR="$RES_DIR/models"
