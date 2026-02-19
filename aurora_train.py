@@ -6,7 +6,7 @@ import torch
 import transformers.utils.import_utils
 _orig_is_torch_ge = transformers.utils.import_utils.is_torch_greater_or_equal
 transformers.utils.import_utils.is_torch_greater_or_equal = (
-    lambda v: True if v == "2.6" else _orig_is_torch_ge(v)
+    lambda v, **kw: True if v == "2.6" else _orig_is_torch_ge(v, **kw)
 )
 
 import torch.nn.functional as F
