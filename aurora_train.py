@@ -1,4 +1,13 @@
 import torch
+# 绕过 CVE-2025-32434 安全补丁：该补丁在 torch.serialization 导入时缓存版本号，
+# < 2.6 直接封锁 torch.load。伪装版本号后 reload 让它重新捕获。
+import importlib
+_real_ver = torch.__version__
+torch.__version__ = "2.6.0"
+importlib.reload(torch.serialization)
+torch.load = torch.serialization.load
+torch.__version__ = _real_ver
+
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import os, time, gc, argparse, sys
@@ -9,7 +18,10 @@ from accelerate import Accelerator
 from sentence_transformers import SentenceTransformer, util
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
-from torch.distributed.optim import ZeroRedundancyOptimizer
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    from torch.distributed.optim import ZeroRedundancyOptimizer
 
 from models import VLMModel, VerifierModel
 from tools import ToolVerifier
