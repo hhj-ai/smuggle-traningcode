@@ -81,35 +81,24 @@ class ToolVerifier:
         print(f"   Devices: DINO→{self.dino_device}, OCR→{self.ocr_device}, CLIP→{self.clip_device}")
 
         # 1. DINO
-        try:
-            self.dino_processor = AutoProcessor.from_pretrained(dino_path, local_files_only=True)
-            self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path, local_files_only=True).to(self.dino_device)
-            self.dino_model.eval()
-            print("   - DINO Ready ✅")
-        except Exception as e:
-            print(f"⚠️ DINO missing or error: {e}")
-            self.dino_model = None
+        self.dino_processor = AutoProcessor.from_pretrained(dino_path, local_files_only=True)
+        self.dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(dino_path, local_files_only=True).to(self.dino_device)
+        self.dino_model.eval()
+        print("   - DINO Ready ✅")
 
         # 2. EasyOCR
         use_gpu = torch.cuda.is_available() and "cuda" in str(self.ocr_device)
-        try:
-            self.ocr_reader = easyocr.Reader(['en'], gpu=use_gpu)
-            print(f"   - OCR Ready (GPU: {use_gpu}) ✅")
-        except: self.ocr_reader = None
+        self.ocr_reader = easyocr.Reader(['en'], gpu=use_gpu)
+        print(f"   - OCR Ready (GPU: {use_gpu}) ✅")
 
         # 3. CLIP (权重文件为 .bin 格式，需要绕过 PyTorch 的 torch.load 安全限制)
-        try:
-            _orig_load = torch.load
-            torch.load = lambda *args, **kwargs: _orig_load(*args, **{k: v for k, v in kwargs.items() if k != 'weights_only'}, weights_only=False)
-            self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(self.clip_device)
-            self.clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
-            torch.load = _orig_load
-            self.clip_model.eval()
-            print("   - CLIP Ready ✅")
-        except Exception as e:
-            torch.load = _orig_load
-            print(f"⚠️ CLIP missing or error: {e}")
-            self.clip_model = None
+        _orig_load = torch.load
+        torch.load = lambda *args, **kwargs: _orig_load(*args, **{k: v for k, v in kwargs.items() if k != 'weights_only'}, weights_only=False)
+        self.clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True).to(self.clip_device)
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
+        torch.load = _orig_load
+        self.clip_model.eval()
+        print("   - CLIP Ready ✅")
 
     def verify_claim(self, claim, image_path):
         if not os.path.exists(image_path): return "uncertain", 0.0, "Img Missing"
