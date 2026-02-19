@@ -131,8 +131,7 @@ rm -rf train.log
 LOG_NAME="train.log"
 
 setsid accelerate launch \
-    --use_deepspeed --deepspeed_config_file "$CODE_DIR/ds_config_zero2.json" \
-    --num_processes "$NUM_TRAIN" \
+    --multi_gpu --num_processes "$NUM_TRAIN" --mixed_precision bf16 \
     aurora_train.py \
     --model_dir "$MODELS_DIR" \
     --data_dir "$DATA_DIR/yfcc100m" \

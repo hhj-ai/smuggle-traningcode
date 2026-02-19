@@ -5,10 +5,11 @@ import os, time, gc, argparse, sys
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-from accelerate import Accelerator
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from sentence_transformers import SentenceTransformer, util
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
+from torch.distributed.fsdp import ShardingStrategy
 
 from models import VLMModel, VerifierModel
 from tools import ToolVerifier
@@ -185,9 +186,17 @@ def train():
                 sys.exit(1)
 
     # 1. 稳定性初始化 (高超时保护)
-    # mixed_precision 由 DeepSpeed config 接管，不在 Accelerator 中指定
+    # FSDP SHARD_GRAD_OP = ZeRO Stage 2（分片优化器状态和梯度，不分片参数）
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+    )
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
-    accelerator = Accelerator(gradient_accumulation_steps=1, kwargs_handlers=[timeout_kwargs])
+    accelerator = Accelerator(
+        fsdp_plugin=fsdp_plugin,
+        mixed_precision="bf16",
+        gradient_accumulation_steps=1,
+        kwargs_handlers=[timeout_kwargs],
+    )
     device = accelerator.device
     torch.backends.cuda.matmul.allow_tf32 = True
 
