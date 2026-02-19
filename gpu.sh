@@ -130,7 +130,8 @@ echo "🔥 启动 AURORA 训练..."
 LOG_NAME="train_final_$(date +%Y%m%d_%H%M).log"
 
 setsid accelerate launch \
-    --multi_gpu --num_processes "$NUM_TRAIN" --mixed_precision bf16 \
+    --use_deepspeed --deepspeed_config_file "$CODE_DIR/ds_config_zero2.json" \
+    --num_processes "$NUM_TRAIN" \
     aurora_train.py \
     --model_dir "$MODELS_DIR" \
     --data_dir "$DATA_DIR/yfcc100m" \

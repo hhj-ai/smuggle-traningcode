@@ -16,16 +16,16 @@ from rewards import RewardCalculator
 
 
 # ============================================================
-# GPU 显存管理器：监控、模型换入换出、OOM 重试
+# GPU 显存管理器：监控、清理、OOM 重试（ZeRO-2 无需 swap）
 # ============================================================
 class GPUMemoryManager:
-    """运行时 GPU 显存管理，支持模型换入换出和 OOM 安全重试"""
+    """运行时 GPU 显存管理，支持 OOM 安全重试"""
 
     def __init__(self, device, accelerator, warn_threshold_mib=4096):
         self.device = device
         self.accelerator = accelerator
         self.rank = accelerator.local_process_index
-        self.warn_threshold_mib = warn_threshold_mib  # 低于此值发出警告
+        self.warn_threshold_mib = warn_threshold_mib
 
     # --- 显存查询 ---
     def get_free_mib(self):
@@ -56,48 +56,6 @@ class GPUMemoryManager:
         gc.collect()
         torch.cuda.empty_cache()
 
-    # --- 模型换出到 CPU（释放 GPU 显存）---
-    def offload(self, model_wrapper, name="model"):
-        """将 DDP 包装的模型内部参数移到 CPU"""
-        inner = self.accelerator.unwrap_model(model_wrapper)
-        inner.to("cpu")
-        self.cleanup()
-        freed = self.get_free_mib()
-        print(f"[MEM-R{self.rank}] ↓ {name} → CPU (GPU free: {freed:.0f}MiB)", flush=True)
-
-    # --- 模型换入到 GPU ---
-    def reload(self, model_wrapper, name="model"):
-        """将模型参数移回 GPU"""
-        inner = self.accelerator.unwrap_model(model_wrapper)
-        inner.to(self.device)
-        free = self.get_free_mib()
-        print(f"[MEM-R{self.rank}] ↑ {name} → GPU (GPU free: {free:.0f}MiB)", flush=True)
-
-    # --- 优化器状态换出到 CPU ---
-    def offload_optimizer(self, optimizer, name="optimizer"):
-        """将优化器状态移到 CPU"""
-        moved = 0
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor) and v.device.type == "cuda":
-                    state[k] = v.cpu()
-                    moved += 1
-        if moved > 0:
-            self.cleanup()
-            print(f"[MEM-R{self.rank}] ↓ {name} states → CPU ({moved} tensors)", flush=True)
-
-    # --- 优化器状态换入到 GPU ---
-    def reload_optimizer(self, optimizer, name="optimizer"):
-        """将优化器状态移回 GPU"""
-        moved = 0
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                    state[k] = v.to(self.device)
-                    moved += 1
-        if moved > 0:
-            print(f"[MEM-R{self.rank}] ↑ {name} states → GPU ({moved} tensors)", flush=True)
-
     # --- OOM 安全执行 ---
     def safe_execute(self, fn, retries=2, cleanup_before_retry=True):
         """
@@ -116,129 +74,6 @@ class GPUMemoryManager:
                 else:
                     print(f"[MEM-R{self.rank}] ❌ OOM after {retries+1} attempts", flush=True)
                     raise
-
-
-# ============================================================
-# GPU 资源自适应调优器
-# ============================================================
-class ResourceAutoTuner:
-    """根据实际 GPU 显存自动推荐 batch_size / group_size / num_gen"""
-
-    # (min_free_gb, batch_size, group_size, num_gen)
-    TIERS = [
-        (40, 16, 8, 10),
-        (30, 12, 6,  8),
-        (20,  8, 4,  6),
-        (12,  4, 4,  5),
-        ( 0,  2, 2,  3),
-    ]
-
-    SAFETY_MARGIN_GB = 2.0  # 安全余量
-
-    def __init__(self, device, accelerator, mem_manager):
-        self.device = device
-        self.accelerator = accelerator
-        self.mem = mem_manager
-        self.rank = accelerator.local_process_index
-
-    def _get_free_gb(self):
-        if not torch.cuda.is_available():
-            return 80.0  # 假设充足
-        free, _ = torch.cuda.mem_get_info(self.device)
-        return free / (1024 ** 3)
-
-    def _pick_tier(self, free_gb):
-        working = free_gb - self.SAFETY_MARGIN_GB
-        for min_free, bs, gs, ng in self.TIERS:
-            if working >= min_free:
-                return bs, gs, ng
-        # 兜底
-        return 2, 2, 3
-
-    def recommend(self, vlm_model, verifier_model,
-                  user_batch_size=0, user_group_size=0, user_num_gen=0):
-        """
-        测量实际可用显存并返回 (batch_size, group_size, num_gen, num_workers, no_swap).
-        user_xxx = 0 表示 auto, > 0 表示用户手动指定.
-        no_swap: 两个模型同时在 GPU 时剩余显存 >= 10GB 则为 True.
-        """
-        # --- 测量 Phase 1 可用显存 (VLM on GPU, Verifier on CPU) ---
-        self.mem.offload(verifier_model, "Verifier (auto-tune)")
-        self.mem.reload(vlm_model, "VLM (auto-tune)")
-        self.mem.cleanup()
-        free_phase1 = self._get_free_gb()
-
-        # --- 测量 Phase 3/4 可用显存 (Verifier on GPU, VLM on CPU) ---
-        self.mem.offload(vlm_model, "VLM (auto-tune)")
-        self.mem.reload(verifier_model, "Verifier (auto-tune)")
-        self.mem.cleanup()
-        free_training = self._get_free_gb()
-
-        # --- 测量两个模型同时在 GPU 时的剩余显存 ---
-        self.mem.reload(vlm_model, "VLM (auto-tune both)")
-        self.mem.cleanup()
-        free_both = self._get_free_gb()
-
-        # 估算 AdamW 优化器状态内存：每个参数需要 2 个 fp32 缓冲区 (momentum + variance)
-        vlm_numel = sum(p.numel() for p in self.accelerator.unwrap_model(vlm_model).parameters())
-        ver_numel = sum(p.numel() for p in self.accelerator.unwrap_model(verifier_model).parameters())
-        opt_state_gb = (vlm_numel + ver_numel) * 8 / (1024 ** 3)  # 2 × fp32 per param
-        grad_gb = max(vlm_numel, ver_numel) * 2 / (1024 ** 3)     # bf16 梯度
-        no_swap_needed = opt_state_gb + grad_gb + 10.0  # 10GB 余量给激活值
-        no_swap = free_both >= no_swap_needed
-
-        if self.accelerator.is_main_process:
-            print(f"[AUTO-TUNE] no_swap check: free_both={free_both:.1f}GB, "
-                  f"opt_states={opt_state_gb:.1f}GB, grads={grad_gb:.1f}GB, "
-                  f"needed={no_swap_needed:.1f}GB → no_swap={no_swap}", flush=True)
-
-        # 恢复初始状态：VLM on GPU, Verifier on CPU (Phase 1 起始状态)
-        self.mem.offload(verifier_model, "Verifier (auto-tune restore)")
-        self.mem.cleanup()
-
-        # 取两阶段较小值作为约束基准
-        effective_free = min(free_phase1, free_training)
-        rec_bs, rec_gs, rec_ng = self._pick_tier(effective_free)
-
-        # num_workers: CPU 核数相关
-        num_workers = min(8, max(1, os.cpu_count() // 2))
-
-        # 应用用户覆盖
-        batch_size = user_batch_size if user_batch_size > 0 else rec_bs
-        group_size = user_group_size if user_group_size > 0 else rec_gs
-        num_gen = user_num_gen if user_num_gen > 0 else rec_ng
-
-        # 约束校验
-        if group_size < 2:
-            group_size = 2
-        if num_gen < group_size:
-            num_gen = group_size
-        if batch_size % group_size != 0:
-            # 向下对齐到 group_size 的倍数
-            batch_size = max(group_size, (batch_size // group_size) * group_size)
-
-        # 用户指定值超过推荐值时发出警告
-        if user_batch_size > 0 and user_batch_size > rec_bs:
-            print(f"[AUTO-TUNE] WARNING: user batch_size={user_batch_size} > recommended={rec_bs}, OOM risk", flush=True)
-        if user_group_size > 0 and user_group_size > rec_gs:
-            print(f"[AUTO-TUNE] WARNING: user group_size={user_group_size} > recommended={rec_gs}, OOM risk", flush=True)
-        if user_num_gen > 0 and user_num_gen > rec_ng:
-            print(f"[AUTO-TUNE] WARNING: user num_gen={user_num_gen} > recommended={rec_ng}, OOM risk", flush=True)
-
-        # GPU 信息
-        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else "N/A"
-        total_gb = torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3) if torch.cuda.is_available() else 0
-
-        if self.accelerator.is_main_process:
-            print(f"[AUTO-TUNE] GPU: {gpu_name} {total_gb:.0f}GB | "
-                  f"Phase1 free: {free_phase1:.1f}GB | Training free: {free_training:.1f}GB | "
-                  f"Both free: {free_both:.1f}GB | no_swap={no_swap}",
-                  flush=True)
-            print(f"[AUTO-TUNE] batch_size={batch_size}, group_size={group_size}, "
-                  f"num_gen={num_gen}, num_workers={num_workers}",
-                  flush=True)
-
-        return batch_size, group_size, num_gen, num_workers, no_swap
 
 
 # --- 高性能 Dataset (1.5TB RAM 优化) ---
@@ -312,9 +147,9 @@ def train():
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--minilm_path", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=0, help="DataLoader batch size (0=auto)")
-    parser.add_argument("--group_size", type=int, default=0, help="GRPO group size per image (0=auto)")
-    parser.add_argument("--num_generations", type=int, default=0, help="VLM candidate generations per image (0=auto)")
+    parser.add_argument("--batch_size", type=int, default=16, help="DataLoader batch size")
+    parser.add_argument("--group_size", type=int, default=8, help="GRPO group size per image")
+    parser.add_argument("--num_generations", type=int, default=10, help="VLM candidate generations per image")
     parser.add_argument("--attack_weight", type=float, default=5.0)
     parser.add_argument("--tool_device", type=str, default=None, help="工具GPU覆盖，逗号分隔 (如 cuda:4,cuda:5)；不指定则自动按显存分配")
     parser.add_argument("--bonus_beta", type=float, default=0.5, help="VLM reward bonus beta")
@@ -324,6 +159,12 @@ def train():
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Checkpoint 目录路径 (如 checkpoints/epoch_2)，或 'latest' 自动查找最新")
     args = parser.parse_args()
+
+    # 固定超参数
+    batch_size = args.batch_size
+    GROUP_SIZE = args.group_size
+    num_gen_default = args.num_generations
+    num_workers = min(8, max(1, os.cpu_count() // 2))
 
     # 0. tool_device 校验（支持逗号分隔多设备）
     tool_devices = None
@@ -344,8 +185,9 @@ def train():
                 sys.exit(1)
 
     # 1. 稳定性初始化 (高超时保护)
+    # mixed_precision 由 DeepSpeed config 接管，不在 Accelerator 中指定
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
-    accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=1, kwargs_handlers=[timeout_kwargs])
+    accelerator = Accelerator(gradient_accumulation_steps=1, kwargs_handlers=[timeout_kwargs])
     device = accelerator.device
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -356,7 +198,7 @@ def train():
 
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        print(f"🚀 AURORA Training")
+        print(f"🚀 AURORA Training (ZeRO-2)")
 
     # ============================================================
     # 断点续传：解析 resume 路径
@@ -467,61 +309,16 @@ def train():
         sys.exit(1)
 
     # ============================================================
-    # 交错 DDP 包装：避免两个模型同时在 GPU 时 Reducer 分配 OOM
-    # DDP Reducer 需要 ~模型大小 的显存用于梯度通信桶
-    # VLM 8B bf16 ≈ 16 GiB, Verifier 7B bf16 ≈ 14 GiB
-    # 同时在 GPU 时峰值 = 16+14+16(Reducer) = 46 GiB，共享 GPU 可能不够
+    # ZeRO-2: 直接 prepare 两个模型和优化器，无需交错 DDP
     # ============================================================
-
-    # Step 1: Verifier → CPU，为 VLM DDP 初始化腾显存
-    verifier.model.to("cpu")
-    mem.cleanup()
-    mem.log("Before VLM DDP (Verifier on CPU)")
-
     v_opt = torch.optim.AdamW(vlm.model.parameters(), lr=1e-6)
-    vlm.model, v_opt = accelerator.prepare(vlm.model, v_opt)
-    mem.log("After VLM DDP")
-
-    # Step 2: VLM 内部 → CPU，为 Verifier DDP 初始化腾显存
-    # 注意：DDP Reducer 的梯度桶仍留在 GPU，但模型参数释放 ~16 GiB
-    accelerator.unwrap_model(vlm.model).to("cpu")
-    mem.cleanup()
-    mem.log("Before Verifier DDP (VLM on CPU)")
-
-    # Step 3: Verifier → GPU 并 DDP 包装
-    verifier.model.to(device)
     ver_opt = torch.optim.AdamW(verifier.model.parameters(), lr=1e-6)
-    verifier.model, ver_opt = accelerator.prepare(verifier.model, ver_opt)
-    mem.log("After Verifier DDP")
-
-    # Step 4: VLM → GPU（训练循环 Phase 1 需要 VLM 在 GPU）
-    accelerator.unwrap_model(vlm.model).to(device)
-    mem.cleanup()
-    mem.log("Both models DDP-wrapped and on GPU")
-
-    # ============================================================
-    # 资源自适应调优：DDP 包装完成后测量实际可用显存
-    # ============================================================
-    tuner = ResourceAutoTuner(device, accelerator, mem)
-    batch_size, GROUP_SIZE, num_gen_default, num_workers, no_swap = tuner.recommend(
-        vlm.model, verifier.model,
-        user_batch_size=args.batch_size,
-        user_group_size=args.group_size,
-        user_num_gen=args.num_generations,
+    vlm.model, v_opt, verifier.model, ver_opt = accelerator.prepare(
+        vlm.model, v_opt, verifier.model, ver_opt
     )
+    mem.log("Models and optimizers prepared with ZeRO-2")
 
-    # no-swap 模式：两个模型始终在 GPU，不做 offload/reload
-    if no_swap:
-        # recommend() 结束时 verifier 在 CPU，需要 reload
-        mem.reload(verifier.model, "Verifier (no-swap init)")
-        if accelerator.is_main_process:
-            print("[NO-SWAP] Both models pinned on GPU, skipping offload/reload in training loop", flush=True)
-
-    # OOM 连续计数器，用于跨 epoch 动态降级
-    oom_counter = 0
-    OOM_DEGRADE_THRESHOLD = 3
-
-    # 延迟创建 DataLoader（依赖 auto-tune 的 batch_size）
+    # 创建 DataLoader
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
                            num_workers=num_workers, pin_memory=True, prefetch_factor=2)
     dataloader = accelerator.prepare(dataloader)
@@ -569,7 +366,6 @@ def train():
     num_epochs = 5
     total_batches = len(dataloader)
     total_steps = num_epochs * total_batches  # 总 step 数
-    # 如果是 resume，global_step 已从 checkpoint 恢复，不重置
     training_start_time = time.time()
 
     for epoch in range(start_epoch, num_epochs):
@@ -580,49 +376,19 @@ def train():
             batch_start_time = time.time()
 
             # ============================================================
-            # PHASE 1: VLM 生成
+            # PHASE 1: VLM 生成（两个模型始终在 GPU）
             # ============================================================
             phase_t0 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
             vlm.disable_gradient_checkpointing()
-            if not no_swap:
-                mem.offload(verifier.model, "Verifier")
 
             flat_desc = []
             flat_images = []
             flat_paths = []
 
             with torch.no_grad():
-                # 批量生成：一次调用所有图片
                 num_gen = num_gen_default
-                def _generate_batch():
-                    return vlm.generate_description_batch(images, num_generations=num_gen)
-                try:
-                    all_results, _ = mem.safe_execute(_generate_batch, retries=1)
-                except torch.cuda.OutOfMemoryError:
-                    # OOM 降级：退回逐图生成
-                    print(f"[MEM-R{mem.rank}] ⚠️ Phase1 batch OOM, falling back to per-image", flush=True)
-                    oom_counter += 1
-                    all_results = []
-                    for idx, (img, path) in enumerate(zip(images, image_paths)):
-                        def _generate_single():
-                            return vlm.generate_description_batch([img], num_generations=num_gen)[0]
-                        try:
-                            raw, _ = mem.safe_execute(_generate_single, retries=1)
-                        except torch.cuda.OutOfMemoryError:
-                            num_gen_fallback = max(GROUP_SIZE, num_gen // 2)
-                            print(f"[MEM-R{mem.rank}] ⚠️ Phase1 OOM img {idx}, 降级: {num_gen_fallback}", flush=True)
-                            oom_counter += 1
-                            try:
-                                def _gen_reduced():
-                                    return vlm.generate_description_batch([img], num_generations=num_gen_fallback)[0]
-                                raw, _ = mem.safe_execute(_gen_reduced, retries=1)
-                            except torch.cuda.OutOfMemoryError:
-                                print(f"[MEM-R{mem.rank}] ⚠️ Phase1 再次 OOM, 跳过图片 {idx}", flush=True)
-                                oom_counter += 1
-                                all_results.append([])
-                                continue
-                        all_results.append(raw)
+                all_results = vlm.generate_description_batch(images, num_generations=num_gen)
 
                 for idx, (img, path) in enumerate(zip(images, image_paths)):
                     raw_list = all_results[idx] if idx < len(all_results) else []
@@ -633,9 +399,6 @@ def train():
                     flat_images.extend([img] * len(diverse))
                     flat_paths.extend([path] * len(diverse))
 
-            if not no_swap:
-                mem.cleanup()
-
             # ============================================================
             # PHASE 2: Verifier 提取 + 工具验证
             # ============================================================
@@ -644,30 +407,13 @@ def train():
             phase_t1 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
             verifier.disable_gradient_checkpointing()
-            if not no_swap:
-                mem.offload(vlm.model, "VLM")
-                mem.reload(verifier.model, "Verifier")
 
             ver_raw_resp = []
             ver_corr_scores = []
             local_claims_list = []
 
             with torch.no_grad():
-                # 批量提取 claims
-                try:
-                    batch_claims, batch_raws = verifier.verify_claims_batch(flat_desc)
-                except torch.cuda.OutOfMemoryError:
-                    # OOM 降级：逐条提取
-                    print(f"[MEM-R{mem.rank}] ⚠️ Phase2 batch OOM, falling back to per-desc", flush=True)
-                    oom_counter += 1
-                    batch_claims, batch_raws = [], []
-                    for desc in flat_desc:
-                        try:
-                            claims, raw = verifier.verify_claims(desc)
-                        except torch.cuda.OutOfMemoryError:
-                            claims, raw = [], ""
-                        batch_claims.append(claims)
-                        batch_raws.append(raw)
+                batch_claims, batch_raws = verifier.verify_claims_batch(flat_desc)
 
                 for i in range(len(flat_desc)):
                     claims = batch_claims[i]
@@ -712,9 +458,6 @@ def train():
                     res_per_desc.append({'verdict': v, 'traceable': t})
                 ver_results.append(res_per_desc)
 
-            if not no_swap:
-                mem.cleanup()
-
             # ============================================================
             # PHASE 3: VLM 训练
             # ============================================================
@@ -722,11 +465,6 @@ def train():
                 print(f"[TIMER] Phase2 (Verify): {time.time()-phase_t1:.1f}s", flush=True)
             phase_t2 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase3-start")
-            if not no_swap:
-                mem.offload_optimizer(ver_opt, "Ver-Opt")
-                mem.reload(vlm.model, "VLM")
-                mem.offload(verifier.model, "Verifier")
-                mem.reload_optimizer(v_opt, "VLM-Opt")
             vlm.enable_gradient_checkpointing()
             accelerator.unwrap_model(vlm.model).train()
             print(f"[MODE-R{mem.rank}] VLM → .train()", flush=True)
@@ -763,42 +501,14 @@ def train():
                 group_images = flat_images[start:end]
                 group_adv = v_adv[group_idx]
 
-                # 批量 log-prob 计算
-                try:
-                    batch_log_probs = vlm.compute_log_probs_batch(group_images, group_desc)
-                    group_loss = sum(-group_adv[k] * batch_log_probs[k] for k in range(len(group_desc)))
-                except torch.cuda.OutOfMemoryError:
-                    # OOM 降级：逐样本计算
-                    print(f"[MEM-R{mem.rank}] ⚠️ Phase3 batch log-prob OOM, per-sample fallback", flush=True)
-                    oom_counter += 1
-                    group_loss = 0
-                    for k in range(len(group_desc)):
-                        text = group_desc[k]
-                        img = group_images[k]
-                        msg = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": "Describe this image in detail."}]}, {"role": "assistant", "content": [{"type": "text", "text": text}]}]
-                        text_in = vlm.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
-                        inputs = vlm.processor(text=[text_in], images=[img], padding=True, return_tensors="pt").to(device)
-                        group_loss += -group_adv[k] * vlm.compute_log_probs(inputs.input_ids, inputs.attention_mask, inputs.input_ids)
+                batch_log_probs = vlm.compute_log_probs_batch(group_images, group_desc)
+                group_loss = sum(-group_adv[k] * batch_log_probs[k] for k in range(len(group_desc)))
 
-                # OOM 安全反向传播
-                def _vlm_backward():
-                    accelerator.backward(group_loss / (len(group_desc) * gradient_accumulation_steps))
-                try:
-                    mem.safe_execute(_vlm_backward, retries=1)
-                except torch.cuda.OutOfMemoryError:
-                    print(f"[MEM-R{mem.rank}] ❌ VLM backward OOM group {group_idx}, skipping", flush=True)
-                    v_opt.zero_grad()
-                    break
+                accelerator.backward(group_loss / (len(group_desc) * gradient_accumulation_steps))
 
             torch.cuda.empty_cache()
-            try:
-                v_opt.step()
-            except torch.cuda.OutOfMemoryError:
-                print(f"[MEM-R{mem.rank}] ❌ VLM optimizer step OOM, skipping", flush=True)
-                oom_counter += 1
+            v_opt.step()
             v_opt.zero_grad()
-            if not no_swap:
-                mem.cleanup()
 
             accelerator.unwrap_model(vlm.model).eval()
             print(f"[MODE-R{mem.rank}] VLM → .eval()", flush=True)
@@ -810,11 +520,6 @@ def train():
                 print(f"[TIMER] Phase3 (VLM train): {time.time()-phase_t2:.1f}s", flush=True)
             phase_t3 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase4-start")
-            if not no_swap:
-                mem.offload_optimizer(v_opt, "VLM-Opt")
-                mem.offload(vlm.model, "VLM")
-                mem.reload(verifier.model, "Verifier")
-                mem.reload_optimizer(ver_opt, "Ver-Opt")
             verifier.enable_gradient_checkpointing()
             accelerator.unwrap_model(verifier.model).train()
             print(f"[MODE-R{mem.rank}] Verifier → .train()", flush=True)
@@ -844,37 +549,14 @@ def train():
                 ver_rew_t_group = torch.tensor(group_ver_rewards, device=device)
                 ver_adv = (ver_rew_t_group - ver_rew_t_group.mean()) / (ver_rew_t_group.std() + 1e-8)
 
-                # 批量 log-prob 计算
-                try:
-                    batch_ver_log_probs = verifier.compute_sequence_log_prob_batch(group_desc, group_raw)
-                    group_ver_loss = sum(-ver_adv[k] * batch_ver_log_probs[k] for k in range(len(group_desc)))
-                except torch.cuda.OutOfMemoryError:
-                    # OOM 降级：逐样本计算
-                    print(f"[MEM-R{mem.rank}] ⚠️ Phase4 batch log-prob OOM, per-sample fallback", flush=True)
-                    oom_counter += 1
-                    group_ver_loss = 0
-                    for k in range(len(group_desc)):
-                        group_ver_loss += -ver_adv[k] * verifier.compute_sequence_log_prob(group_desc[k], group_raw[k])
+                batch_ver_log_probs = verifier.compute_sequence_log_prob_batch(group_desc, group_raw)
+                group_ver_loss = sum(-ver_adv[k] * batch_ver_log_probs[k] for k in range(len(group_desc)))
 
-                # OOM 安全反向传播
-                def _ver_backward():
-                    accelerator.backward(group_ver_loss / (len(group_desc) * gradient_accumulation_steps))
-                try:
-                    mem.safe_execute(_ver_backward, retries=1)
-                except torch.cuda.OutOfMemoryError:
-                    print(f"[MEM-R{mem.rank}] ❌ Verifier backward OOM group {group_idx}, skipping", flush=True)
-                    ver_opt.zero_grad()
-                    break
+                accelerator.backward(group_ver_loss / (len(group_desc) * gradient_accumulation_steps))
 
             torch.cuda.empty_cache()
-            try:
-                ver_opt.step()
-            except torch.cuda.OutOfMemoryError:
-                print(f"[MEM-R{mem.rank}] ❌ Verifier optimizer step OOM, skipping", flush=True)
-                oom_counter += 1
+            ver_opt.step()
             ver_opt.zero_grad()
-            if not no_swap:
-                mem.cleanup()
 
             accelerator.unwrap_model(verifier.model).eval()
             print(f"[MODE-R{mem.rank}] Verifier → .eval()", flush=True)
@@ -882,12 +564,6 @@ def train():
                 print(f"[TIMER] Phase4 (Ver train): {time.time()-phase_t3:.1f}s", flush=True)
 
             # --- batch 结束 ---
-            if not no_swap:
-                mem.offload_optimizer(ver_opt, "Ver-Opt")
-                mem.offload(verifier.model, "Verifier")
-                mem.reload(vlm.model, "VLM")
-                # Phase 1 是 no_grad 推理，不需要 VLM 优化器状态在 GPU
-
             ver_rew_display = global_ver_rew_t.mean().item()
             if accelerator.is_main_process:
                 batch_elapsed = time.time() - batch_start_time
@@ -924,11 +600,9 @@ def train():
                           f"V_Rew={v_rew_t.mean().item():.2f} Ver_Rew={ver_rew_display:.2f}",
                           flush=True)
 
-        # Save Checkpoint — 两个模型都要在 GPU 上才能 save
+        # Save Checkpoint
         v_opt.zero_grad()
         ver_opt.zero_grad()
-        if not no_swap:
-            mem.reload(verifier.model, "Verifier")
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             save_p = os.path.join(checkpoint_dir, f"epoch_{epoch}")
@@ -956,8 +630,7 @@ def train():
             print(f"[CKPT] Epoch {epoch} saved to {save_p} (latest → {save_p})", flush=True)
 
         # Epoch 结束汇总
-        if no_swap:
-            mem.cleanup()  # no-swap 模式：每 epoch 结束清理一次
+        mem.cleanup()
         if accelerator.is_main_process:
             epoch_time = time.time() - epoch_start_time
             total_elapsed = time.time() - training_start_time
@@ -970,36 +643,5 @@ def train():
                   f"Total elapsed {total_elapsed/60:.1f}min | "
                   f"Remaining {remaining_epochs} epochs, ETA ~{eta_h}h{eta_m:02d}m",
                   flush=True)
-
-        # --- 跨 epoch OOM 动态降级 ---
-        if oom_counter >= OOM_DEGRADE_THRESHOLD:
-            old_bs, old_gs, old_ng = batch_size, GROUP_SIZE, num_gen_default
-            # 降一档：找到当前 tier 的下一级
-            downgraded = False
-            for i, (_, t_bs, t_gs, t_ng) in enumerate(ResourceAutoTuner.TIERS):
-                if t_bs == batch_size and t_gs == GROUP_SIZE:
-                    if i + 1 < len(ResourceAutoTuner.TIERS):
-                        _, batch_size, GROUP_SIZE, num_gen_default = ResourceAutoTuner.TIERS[i + 1]
-                        downgraded = True
-                    break
-            if not downgraded and batch_size > 2:
-                # 当前不在标准 tier 上，手动减半
-                GROUP_SIZE = max(2, GROUP_SIZE // 2)
-                num_gen_default = max(GROUP_SIZE, num_gen_default // 2)
-                batch_size = max(GROUP_SIZE, (batch_size // 2 // GROUP_SIZE) * GROUP_SIZE)
-            if batch_size != old_bs or GROUP_SIZE != old_gs:
-                # 重建 DataLoader
-                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                                       collate_fn=collate_fn, num_workers=num_workers,
-                                       pin_memory=True, prefetch_factor=2)
-                dataloader = accelerator.prepare(dataloader)
-                total_batches = len(dataloader)
-                total_steps = num_epochs * total_batches
-                if accelerator.is_main_process:
-                    print(f"[AUTO-TUNE] OOM count={oom_counter} >= {OOM_DEGRADE_THRESHOLD}, "
-                          f"降级: batch_size {old_bs}->{batch_size}, "
-                          f"group_size {old_gs}->{GROUP_SIZE}, "
-                          f"num_gen {old_ng}->{num_gen_default}", flush=True)
-            oom_counter = 0  # 重置计数器
 
 if __name__ == "__main__": train()
