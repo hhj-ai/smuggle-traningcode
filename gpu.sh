@@ -127,7 +127,8 @@ fi
 
 # 7. 启动
 echo "🔥 启动 AURORA 训练..."
-LOG_NAME="train_final_$(date +%Y%m%d_%H%M).log"
+rm -rf train.log
+LOG_NAME="train.log"
 
 setsid accelerate launch \
     --use_deepspeed --deepspeed_config_file "$CODE_DIR/ds_config_zero2.json" \
