@@ -175,38 +175,51 @@ class ToolVerifier:
 
     def verify_claims_batch(self, claims_by_image, preloaded_images=None):
         """
-        批量验证 claims，按图片分组，每张图只加载一次。
-        claims_by_image: [(image_path, [claim1, claim2, ...]), ...]
-        preloaded_images: 可选 dict {image_path: PIL.Image}，避免重复磁盘 IO
-        返回: {(image_path, claim): verdict}
+        批量验证 claims，按图片分组。
+        DINO 和 CLIP 用独立线程池，多 worker 并发处理不同图片。
+        同一模型 eval 模式下线程安全，不需要多份权重。
+        显存开销：模型权重固定 ~1.7GB + 每并发图 ~300MiB 中间张量。
         """
         results = {}
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            for img_path, claims in claims_by_image:
-                if not claims:
+        valid_items = []
+        for img_path, claims in claims_by_image:
+            if not claims:
+                continue
+            image = None
+            if preloaded_images and img_path in preloaded_images:
+                image = preloaded_images[img_path]
+            else:
+                if not os.path.exists(img_path):
+                    for c in claims:
+                        results[(img_path, c)] = "uncertain"
                     continue
-                # 尝试使用预加载图片
-                image = None
-                if preloaded_images and img_path in preloaded_images:
-                    image = preloaded_images[img_path]
-                else:
-                    if not os.path.exists(img_path):
-                        for c in claims:
-                            results[(img_path, c)] = "uncertain"
-                        continue
-                    try:
-                        image = Image.open(img_path).convert("RGB")
-                    except:
-                        for c in claims:
-                            results[(img_path, c)] = "uncertain"
-                        continue
+                try:
+                    image = Image.open(img_path).convert("RGB")
+                except:
+                    for c in claims:
+                        results[(img_path, c)] = "uncertain"
+                    continue
+            valid_items.append((img_path, claims, image))
 
-                # 并行执行 DINO 和 CLIP（它们在不同设备上）
-                dino_future = executor.submit(self._batch_verify_dino, claims, image)
-                clip_future = executor.submit(self._batch_verify_clip, claims, image)
-                dino_scores = dino_future.result()
-                clip_scores = clip_future.result()
+        # 根据空闲显存动态计算安全并发数（每并发图 ~300MiB 中间张量）
+        n_workers = 4  # 默认值
+        if torch.cuda.is_available():
+            try:
+                free_mib = torch.cuda.mem_get_info(self.dino_device)[0] / (1024 * 1024)
+                n_workers = max(1, min(8, int(free_mib // 500)))  # 每路预留 500MiB
+            except:
+                pass
 
+        with ThreadPoolExecutor(max_workers=n_workers) as dino_pool, \
+             ThreadPoolExecutor(max_workers=n_workers) as clip_pool:
+            dino_futures = [dino_pool.submit(self._batch_verify_dino, claims, image)
+                           for _, claims, image in valid_items]
+            clip_futures = [clip_pool.submit(self._batch_verify_clip, claims, image)
+                           for _, claims, image in valid_items]
+
+            for idx, (img_path, claims, _) in enumerate(valid_items):
+                dino_scores = dino_futures[idx].result()
+                clip_scores = clip_futures[idx].result()
                 for i, c in enumerate(claims):
                     score = max(dino_scores[i], clip_scores[i])
                     if score <= 0.0:

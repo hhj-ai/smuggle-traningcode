@@ -117,16 +117,19 @@ class YFCCDataset(Dataset):
 def collate_fn(batch):
     return [item[0] for item in batch], [item[1] for item in batch]
 
-def encode_long_texts(model, texts, chunk_words=200):
-    """对超长文本分块编码后取平均，避免 MiniLM 512 token 截断丢失信息。"""
+def encode_long_texts(model, texts, max_tokens=450):
+    """对超长文本按 token 精确分块编码后取平均，避免 MiniLM 512 截断。"""
+    tokenizer = model.tokenizer
     all_embs = []
     for text in texts:
-        words = text.split()
-        if len(words) <= chunk_words:
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if len(ids) <= max_tokens:
             all_embs.append(model.encode(text, convert_to_tensor=True))
         else:
-            chunks = [" ".join(words[i:i+chunk_words])
-                      for i in range(0, len(words), chunk_words)]
+            chunks = []
+            for i in range(0, len(ids), max_tokens):
+                chunk_text = tokenizer.decode(ids[i:i+max_tokens], skip_special_tokens=True)
+                chunks.append(chunk_text)
             chunk_embs = model.encode(chunks, convert_to_tensor=True)
             all_embs.append(chunk_embs.mean(dim=0))
     return torch.stack(all_embs)
