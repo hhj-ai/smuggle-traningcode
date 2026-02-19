@@ -206,26 +206,39 @@ class VLMModel:
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
 
-    def generate_description_batch(self, image_inputs, num_generations=4):
-        print(f"[DEBUG-VLM] Starting generate_description_batch for {len(image_inputs)} images, {num_generations} generations", flush=True)
+    def generate_description_batch(self, image_inputs, num_generations=4, sub_batch_size=None):
+        print(f"[DEBUG-VLM] Starting generate_description_batch for {len(image_inputs)} images, "
+              f"{num_generations} generations, sub_batch_size={sub_batch_size}", flush=True)
+
+        # sub_batch_size=None → 原始行为（一次性处理所有图片）
+        if sub_batch_size is None or sub_batch_size >= len(image_inputs):
+            return self._generate_batch_inner(image_inputs, num_generations)
+
+        # 分批生成，每批之间释放 KV cache
+        all_results = []
+        for i in range(0, len(image_inputs), sub_batch_size):
+            sub_images = image_inputs[i:i + sub_batch_size]
+            print(f"[DEBUG-VLM] Sub-batch {i//sub_batch_size}: {len(sub_images)} images", flush=True)
+            sub_results = self._generate_batch_inner(sub_images, num_generations)
+            all_results.extend(sub_results)
+            del sub_results
+            torch.cuda.empty_cache()
+        return all_results
+
+    def _generate_batch_inner(self, image_inputs, num_generations):
         messages_batch = []
         for _ in image_inputs:
             messages = [{"role": "user", "content": [{"type": "image", "image": None}, {"type": "text", "text": "Describe this image in detail."}]}]
             messages_batch.append(messages)
         text_prompts = [self.processor.apply_chat_template(msg, add_generation_prompt=True) for msg in messages_batch]
-        print(f"[DEBUG-VLM] Applied chat template, preparing inputs", flush=True)
         inputs = self.processor(text=text_prompts, images=image_inputs, padding=True, return_tensors="pt").to(self.device)
-        print(f"[DEBUG-VLM] Inputs prepared, shape: {inputs.input_ids.shape}", flush=True)
 
         model_to_gen = _unwrap_model(self.model)
 
-        print(f"[DEBUG-VLM] Model unpacked, starting generation", flush=True)
         with torch.no_grad():
             generated_ids = model_to_gen.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=1.0, num_return_sequences=num_generations)
-        print(f"[DEBUG-VLM] Generation complete, shape: {generated_ids.shape}", flush=True)
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids.repeat_interleave(num_generations, dim=0), generated_ids)]
         texts = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
-        print(f"[DEBUG-VLM] Decoded {len(texts)} texts", flush=True)
         return [texts[i * num_generations : (i + 1) * num_generations] for i in range(len(image_inputs))]
 
     def compute_log_probs(self, input_ids, attention_mask, labels):

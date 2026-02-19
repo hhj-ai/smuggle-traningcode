@@ -86,6 +86,98 @@ class GPUMemoryManager:
                     raise
 
 
+# ============================================================
+# GPU 显存自动调参器：根据空闲显存动态计算最优 batch 参数
+# ============================================================
+class MemoryAutoTuner:
+    """模型加载后测量空闲显存，按显存模型自动计算各 phase 最优参数。"""
+
+    # 显存成本常量 (MiB, bf16)
+    VLM_KV_PER_SEQ = 222       # Qwen3-VL-8B, 256 token KV cache
+    VER_KV_PER_SEQ = 188       # DeepSeek-R1-7B, 256 token KV cache
+    VLM_TRAIN_PER_SEQ = 180    # gradient checkpointing ON
+    VER_TRAIN_PER_SEQ = 150    # gradient checkpointing ON
+    SAFETY_FACTOR = 0.85
+
+    def __init__(self, mem_manager, num_generations, cli_args):
+        self.mem = mem_manager
+        self.num_gen = num_generations
+        self.cli_args = cli_args
+
+        # 自动计算值（calibrate 后填充）
+        self.vlm_gen_sub_batch = None
+        self.batch_size = None
+        self.ver_claims_max_batch = None
+        self.vlm_logprob_max_batch = None
+        self.ver_logprob_max_batch = None
+
+    def calibrate(self):
+        """模型加载后调用：测量空闲显存并计算最优参数。"""
+        free = self.mem.get_free_mib()
+        usable = free * self.SAFETY_FACTOR
+
+        # Phase 1: VLM 生成 sub_batch_size
+        self.vlm_gen_sub_batch = max(1, int(usable / (self.VLM_KV_PER_SEQ * self.num_gen)))
+
+        # batch_size 受 sub_batch 限制
+        self.batch_size = min(self.vlm_gen_sub_batch * 4, 24)
+
+        # Phase 2: Verifier claims 生成
+        self.ver_claims_max_batch = min(max(1, int(usable / self.VER_KV_PER_SEQ)), 64)
+
+        # Phase 3: VLM log-prob (训练)
+        self.vlm_logprob_max_batch = min(max(1, int(usable / self.VLM_TRAIN_PER_SEQ)), 16)
+
+        # Phase 4: Verifier log-prob (训练)
+        self.ver_logprob_max_batch = min(max(1, int(usable / self.VER_TRAIN_PER_SEQ)), 48)
+
+        # CLI 覆盖：用户显式指定的值优先
+        if hasattr(self.cli_args, 'batch_size') and self.cli_args.batch_size != 16:
+            self.batch_size = self.cli_args.batch_size
+
+        self._print_params(free)
+
+    def _print_params(self, free_mib):
+        print(f"[AutoTuner] Free={free_mib:.0f}MiB | "
+              f"batch_size={self.batch_size} "
+              f"vlm_gen_sub_batch={self.vlm_gen_sub_batch} "
+              f"ver_claims_max_batch={self.ver_claims_max_batch} "
+              f"vlm_logprob_max_batch={self.vlm_logprob_max_batch} "
+              f"ver_logprob_max_batch={self.ver_logprob_max_batch}",
+              flush=True)
+
+    def get_phase_params(self, phase):
+        """返回指定 phase 的参数字典。"""
+        if phase == 1:
+            return {"sub_batch_size": self.vlm_gen_sub_batch}
+        elif phase == 2:
+            return {"max_batch": self.ver_claims_max_batch}
+        elif phase == 3:
+            return {"max_batch": self.vlm_logprob_max_batch}
+        elif phase == 4:
+            return {"max_batch": self.ver_logprob_max_batch}
+        return {}
+
+    def reduce_params(self, phase):
+        """OOM 时将对应 phase 的 batch 参数减半（持久生效）。"""
+        if phase == 1:
+            self.vlm_gen_sub_batch = max(1, self.vlm_gen_sub_batch // 2)
+            self.batch_size = max(1, self.batch_size // 2)
+        elif phase == 2:
+            self.ver_claims_max_batch = max(1, self.ver_claims_max_batch // 2)
+        elif phase == 3:
+            self.vlm_logprob_max_batch = max(1, self.vlm_logprob_max_batch // 2)
+        elif phase == 4:
+            self.ver_logprob_max_batch = max(1, self.ver_logprob_max_batch // 2)
+        print(f"[AutoTuner] Phase {phase} params reduced: "
+              f"vlm_gen_sub_batch={self.vlm_gen_sub_batch} "
+              f"batch_size={self.batch_size} "
+              f"ver_claims={self.ver_claims_max_batch} "
+              f"vlm_lp={self.vlm_logprob_max_batch} "
+              f"ver_lp={self.ver_logprob_max_batch}",
+              flush=True)
+
+
 # --- 高性能 Dataset (1.5TB RAM 优化) ---
 class YFCCDataset(Dataset):
     def __init__(self, root_dir):
@@ -358,6 +450,13 @@ def train():
     )
     mem.log("ZeroRedundancyOptimizer created")
 
+    # ============================================================
+    # 显存自动调参
+    # ============================================================
+    tuner = MemoryAutoTuner(mem, num_gen_default, args)
+    tuner.calibrate()
+    batch_size = tuner.batch_size  # 覆盖 CLI 默认值
+
     # 创建 DataLoader
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
                            num_workers=num_workers, pin_memory=True, prefetch_factor=2)
@@ -416,7 +515,7 @@ def train():
             batch_start_time = time.time()
 
             # ============================================================
-            # PHASE 1: VLM 生成（两个模型始终在 GPU）
+            # PHASE 1: VLM 生成（两个模型始终在 GPU）— OOM 自动降级
             # ============================================================
             phase_t0 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase1-start")
@@ -429,29 +528,45 @@ def train():
             flat_desc = []
             flat_images = []
             flat_paths = []
+            phase1_ok = False
 
-            with torch.no_grad():
-                num_gen = num_gen_default
-                all_results = vlm.generate_description_batch(images, num_generations=num_gen)
+            for _p1_attempt in range(3):
+                try:
+                    with torch.no_grad():
+                        num_gen = num_gen_default
+                        p1_params = tuner.get_phase_params(1)
+                        all_results = vlm.generate_description_batch(
+                            images, num_generations=num_gen,
+                            sub_batch_size=p1_params["sub_batch_size"])
 
-                for idx, (img, path) in enumerate(zip(images, image_paths)):
-                    raw_list = all_results[idx] if idx < len(all_results) else []
-                    if not raw_list:
-                        continue
-                    diverse = select_diverse_descriptions(raw_list, similarity_model, GROUP_SIZE)
-                    flat_desc.extend(diverse)
-                    flat_images.extend([img] * len(diverse))
-                    flat_paths.extend([path] * len(diverse))
+                        for idx, (img, path) in enumerate(zip(images, image_paths)):
+                            raw_list = all_results[idx] if idx < len(all_results) else []
+                            if not raw_list:
+                                continue
+                            diverse = select_diverse_descriptions(raw_list, similarity_model, GROUP_SIZE)
+                            flat_desc.extend(diverse)
+                            flat_images.extend([img] * len(diverse))
+                            flat_paths.extend([path] * len(diverse))
+                    phase1_ok = True
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    print(f"[AutoTuner-R{mem.rank}] Phase1 OOM (attempt {_p1_attempt+1}/3)", flush=True)
+                    flat_desc, flat_images, flat_paths = [], [], []
+                    mem.cleanup()
+                    tuner.reduce_params(1)
+
+            if not phase1_ok:
+                print(f"[AutoTuner-R{mem.rank}] Phase1 failed 3x, skipping batch", flush=True)
+                continue
 
             # ============================================================
-            # PHASE 2: Verifier 提取 + 工具验证
+            # PHASE 2: Verifier 提取 + 工具验证 — OOM 自动降级
             # ============================================================
             if accelerator.is_main_process:
                 print(f"[TIMER] Phase1 (VLM gen): {time.time()-phase_t0:.1f}s", flush=True)
             phase_t1 = time.time()
             mem.log(f"E{epoch}B{batch_idx} Phase2-start")
             verifier.disable_gradient_checkpointing()
-            # 验证 gradient checkpointing 已关闭（否则 KV cache 失效，生成慢 10x）
             _ver_inner = accelerator.unwrap_model(verifier.model)
             if hasattr(_ver_inner, 'is_gradient_checkpointing') and _ver_inner.is_gradient_checkpointing:
                 print(f"[WARN-R{mem.rank}] Verifier gradient_checkpointing still ON in Phase2!", flush=True)
@@ -460,16 +575,32 @@ def train():
             ver_raw_resp = []
             ver_corr_scores = []
             local_claims_list = []
+            phase2_ok = False
 
-            with torch.no_grad():
-                batch_claims, batch_raws = verifier.verify_claims_batch(flat_desc)
+            for _p2_attempt in range(3):
+                try:
+                    with torch.no_grad():
+                        p2_params = tuner.get_phase_params(2)
+                        batch_claims, batch_raws = verifier.verify_claims_batch(
+                            flat_desc, max_batch=p2_params["max_batch"])
 
-                for i in range(len(flat_desc)):
-                    claims = batch_claims[i]
-                    raw = batch_raws[i]
-                    ver_raw_resp.append(raw)
-                    ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
-                    local_claims_list.append((claims, flat_paths[i], flat_desc[i]))
+                        for i in range(len(flat_desc)):
+                            claims = batch_claims[i]
+                            raw = batch_raws[i]
+                            ver_raw_resp.append(raw)
+                            ver_corr_scores.append(calculate_intra_claim_correlation(claims, similarity_model))
+                            local_claims_list.append((claims, flat_paths[i], flat_desc[i]))
+                    phase2_ok = True
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    print(f"[AutoTuner-R{mem.rank}] Phase2 OOM (attempt {_p2_attempt+1}/3)", flush=True)
+                    ver_raw_resp, ver_corr_scores, local_claims_list = [], [], []
+                    mem.cleanup()
+                    tuner.reduce_params(2)
+
+            if not phase2_ok:
+                print(f"[AutoTuner-R{mem.rank}] Phase2 failed 3x, skipping batch", flush=True)
+                continue
 
             # 各 rank 本地工具验证（无需 gather/scatter，8x 并行）
             img_claims_map = {}
@@ -508,7 +639,7 @@ def train():
                 ver_results.append(res_per_desc)
 
             # ============================================================
-            # PHASE 3: VLM 训练
+            # PHASE 3: VLM 训练 — OOM 自动降级
             # ============================================================
             if accelerator.is_main_process:
                 print(f"[TIMER] Phase2 (Verify): {time.time()-phase_t1:.1f}s", flush=True)
@@ -541,29 +672,45 @@ def train():
             v_rew_t = torch.tensor(all_vlm_rewards, device=device).view(-1, GROUP_SIZE)
             v_adv = (v_rew_t - v_rew_t.mean(1, keepdim=True)) / (v_rew_t.std(1, keepdim=True) + 1e-8)
 
-            v_opt.zero_grad()
-            gradient_accumulation_steps = len(images)
+            phase3_ok = False
+            for _p3_attempt in range(3):
+                try:
+                    v_opt.zero_grad()
+                    gradient_accumulation_steps = len(images)
+                    p3_params = tuner.get_phase_params(3)
 
-            for group_idx in range(len(images)):
-                start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
-                group_desc = flat_desc[start:end]
-                group_images = flat_images[start:end]
-                group_adv = v_adv[group_idx]
+                    for group_idx in range(len(images)):
+                        start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
+                        group_desc = flat_desc[start:end]
+                        group_images = flat_images[start:end]
+                        group_adv = v_adv[group_idx]
 
-                batch_log_probs = vlm.compute_log_probs_batch(group_images, group_desc)
-                group_loss = sum(-group_adv[k] * batch_log_probs[k] for k in range(len(group_desc)))
+                        batch_log_probs = vlm.compute_log_probs_batch(
+                            group_images, group_desc, max_batch=p3_params["max_batch"])
+                        group_loss = sum(-group_adv[k] * batch_log_probs[k] for k in range(len(group_desc)))
 
-                accelerator.backward(group_loss / (len(group_desc) * gradient_accumulation_steps))
+                        accelerator.backward(group_loss / (len(group_desc) * gradient_accumulation_steps))
 
-            torch.cuda.empty_cache()
-            v_opt.step()
-            v_opt.zero_grad()
+                    torch.cuda.empty_cache()
+                    v_opt.step()
+                    v_opt.zero_grad()
+                    phase3_ok = True
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    print(f"[AutoTuner-R{mem.rank}] Phase3 OOM (attempt {_p3_attempt+1}/3)", flush=True)
+                    v_opt.zero_grad()
+                    mem.cleanup()
+                    tuner.reduce_params(3)
+
+            if not phase3_ok:
+                print(f"[AutoTuner-R{mem.rank}] Phase3 failed 3x, skipping VLM update", flush=True)
+                v_opt.zero_grad()
 
             accelerator.unwrap_model(vlm.model).eval()
             print(f"[MODE-R{mem.rank}] VLM → .eval()", flush=True)
 
             # ============================================================
-            # PHASE 4: Verifier 训练
+            # PHASE 4: Verifier 训练 — OOM 自动降级
             # ============================================================
             if accelerator.is_main_process:
                 print(f"[TIMER] Phase3 (VLM train): {time.time()-phase_t2:.1f}s", flush=True)
@@ -579,33 +726,50 @@ def train():
                 all_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
 
             global_ver_rew_t = torch.tensor(all_ver_rewards, device=device)
-            ver_opt.zero_grad()
-            gradient_accumulation_steps = len(images)
 
-            for group_idx in range(len(images)):
-                start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
-                group_desc = flat_desc[start:end]
-                group_raw = ver_raw_resp[start:end]
-                group_results = ver_results[start:end]
-                group_corr = ver_corr_scores[start:end]
+            phase4_ok = False
+            for _p4_attempt in range(3):
+                try:
+                    ver_opt.zero_grad()
+                    gradient_accumulation_steps = len(images)
+                    p4_params = tuner.get_phase_params(4)
 
-                group_ver_rewards = []
-                for k in range(len(group_desc)):
-                    res_list = group_results[k]
-                    r_sum = sum(reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], group_corr[k]) for r in res_list)
-                    group_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
+                    for group_idx in range(len(images)):
+                        start, end = group_idx * GROUP_SIZE, (group_idx + 1) * GROUP_SIZE
+                        group_desc = flat_desc[start:end]
+                        group_raw = ver_raw_resp[start:end]
+                        group_results = ver_results[start:end]
+                        group_corr = ver_corr_scores[start:end]
 
-                ver_rew_t_group = torch.tensor(group_ver_rewards, device=device)
-                ver_adv = (ver_rew_t_group - ver_rew_t_group.mean()) / (ver_rew_t_group.std() + 1e-8)
+                        group_ver_rewards = []
+                        for k in range(len(group_desc)):
+                            res_list = group_results[k]
+                            r_sum = sum(reward_calc.calculate_verifier_reward(r['verdict'], r['traceable'], group_corr[k]) for r in res_list)
+                            group_ver_rewards.append(r_sum / (len(res_list) if res_list else 1))
 
-                batch_ver_log_probs = verifier.compute_sequence_log_prob_batch(group_desc, group_raw)
-                group_ver_loss = sum(-ver_adv[k] * batch_ver_log_probs[k] for k in range(len(group_desc)))
+                        ver_rew_t_group = torch.tensor(group_ver_rewards, device=device)
+                        ver_adv = (ver_rew_t_group - ver_rew_t_group.mean()) / (ver_rew_t_group.std() + 1e-8)
 
-                accelerator.backward(group_ver_loss / (len(group_desc) * gradient_accumulation_steps))
+                        batch_ver_log_probs = verifier.compute_sequence_log_prob_batch(
+                            group_desc, group_raw, max_batch=p4_params["max_batch"])
+                        group_ver_loss = sum(-ver_adv[k] * batch_ver_log_probs[k] for k in range(len(group_desc)))
 
-            torch.cuda.empty_cache()
-            ver_opt.step()
-            ver_opt.zero_grad()
+                        accelerator.backward(group_ver_loss / (len(group_desc) * gradient_accumulation_steps))
+
+                    torch.cuda.empty_cache()
+                    ver_opt.step()
+                    ver_opt.zero_grad()
+                    phase4_ok = True
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    print(f"[AutoTuner-R{mem.rank}] Phase4 OOM (attempt {_p4_attempt+1}/3)", flush=True)
+                    ver_opt.zero_grad()
+                    mem.cleanup()
+                    tuner.reduce_params(4)
+
+            if not phase4_ok:
+                print(f"[AutoTuner-R{mem.rank}] Phase4 failed 3x, skipping Verifier update", flush=True)
+                ver_opt.zero_grad()
 
             accelerator.unwrap_model(verifier.model).eval()
             print(f"[MODE-R{mem.rank}] Verifier → .eval()", flush=True)
