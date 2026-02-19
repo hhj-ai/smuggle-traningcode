@@ -5,11 +5,11 @@ import os, time, gc, argparse, sys
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate import Accelerator
 from sentence_transformers import SentenceTransformer, util
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
-from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.optim import ZeroRedundancyOptimizer
 
 from models import VLMModel, VerifierModel
 from tools import ToolVerifier
@@ -186,13 +186,8 @@ def train():
                 sys.exit(1)
 
     # 1. 稳定性初始化 (高超时保护)
-    # FSDP SHARD_GRAD_OP = ZeRO Stage 2（分片优化器状态和梯度，不分片参数）
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-    )
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
     accelerator = Accelerator(
-        fsdp_plugin=fsdp_plugin,
         mixed_precision="bf16",
         gradient_accumulation_steps=1,
         kwargs_handlers=[timeout_kwargs],
@@ -207,7 +202,7 @@ def train():
 
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        print(f"🚀 AURORA Training (ZeRO-2)")
+        print(f"🚀 AURORA Training (DDP + ZeRO-1 Optimizer)")
 
     # ============================================================
     # 断点续传：解析 resume 路径
@@ -318,14 +313,24 @@ def train():
         sys.exit(1)
 
     # ============================================================
-    # ZeRO-2: 直接 prepare 两个模型和优化器，无需交错 DDP
+    # DDP 包装 + ZeroRedundancyOptimizer（优化器状态跨 GPU 分片）
     # ============================================================
-    v_opt = torch.optim.AdamW(vlm.model.parameters(), lr=1e-6)
-    ver_opt = torch.optim.AdamW(verifier.model.parameters(), lr=1e-6)
-    vlm.model, v_opt, verifier.model, ver_opt = accelerator.prepare(
-        vlm.model, v_opt, verifier.model, ver_opt
+    vlm.model, verifier.model = accelerator.prepare(vlm.model, verifier.model)
+    mem.log("Models DDP-wrapped")
+
+    # ZeroRedundancyOptimizer: 优化器状态分片到各 GPU，等效 ZeRO-1
+    # 必须在 DDP 包装后创建，使用 DDP-wrapped 模型的 parameters
+    v_opt = ZeroRedundancyOptimizer(
+        vlm.model.parameters(),
+        optimizer_class=torch.optim.AdamW,
+        lr=1e-6,
     )
-    mem.log("Models and optimizers prepared with ZeRO-2")
+    ver_opt = ZeroRedundancyOptimizer(
+        verifier.model.parameters(),
+        optimizer_class=torch.optim.AdamW,
+        lr=1e-6,
+    )
+    mem.log("ZeroRedundancyOptimizer created")
 
     # 创建 DataLoader
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
@@ -612,6 +617,9 @@ def train():
         # Save Checkpoint
         v_opt.zero_grad()
         ver_opt.zero_grad()
+        # ZeroRedundancyOptimizer: 先汇总各 rank 的分片状态到 rank 0
+        v_opt.consolidate_state_dict()
+        ver_opt.consolidate_state_dict()
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             save_p = os.path.join(checkpoint_dir, f"epoch_{epoch}")
